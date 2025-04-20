@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
+use fs2::FileExt;
+use tempfile::tempfile_in;
 
 // Import from the library crate
 use llamapak::{
@@ -98,25 +100,96 @@ impl BackupServer {
         cert_path: &Path,
         key_path: &Path,
     ) -> Result<Self> {
-        // Check if certificate and key files exist, generate them if they don't
+        let storage_path = storage_path.into();
+        
+        // Create a storage directory if it doesn't exist
+        std::fs::create_dir_all(&storage_path)
+            .with_context(|| format!("Failed to create storage directory at {}", storage_path.display()))?;
+        
+        // Verify the storage directory is writable
+        match tempfile_in(&storage_path) {
+            Ok(_) => { /* Directory is writable */ }
+            Err(e) => {
+                return Err(anyhow::anyhow!("Storage directory {} is not writable: {}", 
+                                  storage_path.display(), e));
+            }
+        }
+
+        // Use a file lock to prevent race conditions during certificate generation
         if !cert_path.exists() || !key_path.exists() {
             warn!("Certificate or key file not found, generating self-signed certificate");
             warn!("For production use, it is recommended to use a properly signed certificate");
-            generate_self_signed_cert(cert_path, key_path)?;
+            
+            // Create a lock file
+            let lock_path = cert_path.with_file_name(".cert_generation.lock");
+            let lock_file = std::fs::File::create(&lock_path)
+                .context("Failed to create lock file for certificate generation")?;
+
+            if lock_file.try_lock_exclusive().is_ok() {
+                // We got the lock, generate certificates
+                generate_self_signed_cert(cert_path, key_path)
+                    .with_context(|| "Failed to generate self-signed certificate")?;
+                fs2::FileExt::unlock(&lock_file)?;
+            } else {
+                // Wait for the process to generate a certificate
+                let mut attempt = 0;
+                let max_attempts = 10;
+                let wait_time = std::time::Duration::from_secs(1);
+
+                while attempt < max_attempts {
+                    std::thread::sleep(wait_time);
+                    attempt += 1;
+
+                    if cert_path.exists() && key_path.exists() {
+                        info!("Certificates found after waiting {} seconds", attempt);
+                        break;
+                    }
+
+                    debug!("Waiting for certificates to be created... ({}/{})", attempt, max_attempts);
+                }
+
+                // Verify the certificates were actually created after waiting
+                if !cert_path.exists() || !key_path.exists() {
+                    return Err(anyhow::anyhow!("Certificates not created after waiting {} seconds", max_attempts));
+                }
+            }
+            
+            let _ = std::fs::remove_file(lock_path);
         }
-
-        let certs = load_certs(cert_path)?;
-        let key = load_private_key(key_path)?;
-
+        
+        // Verify certificate and key files are readable before loading
+        if !cert_path.exists() {
+            return Err(anyhow::anyhow!(
+                "Certificate file does not exist at {}",
+                cert_path.display()
+            ));
+        }
+        if !key_path.exists() {
+            return Err(anyhow::anyhow!(
+                "Private key file does not exist at {}",
+                key_path.display()
+            ));
+        }
+        
+        let certs = load_certs(cert_path)
+            .with_context(|| format!("Failed to load certificates from {}", cert_path.display()))?;
+        let key = load_private_key(key_path)
+            .with_context(|| format!("Failed to load private key from {}", key_path.display()))?;
+        
+        // Check if there are any certificates
+        if certs.is_empty() {
+            return Err(anyhow::anyhow!("No certificates found in {}", cert_path.display()));
+        }
+        
         let config = rustls::ServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
-            .with_single_cert(certs, key)?;
-
+            .with_single_cert(certs, key)
+            .with_context(|| "Failed to create TLS server configuration")?;
         let acceptor = TlsAcceptor::from(std::sync::Arc::new(config));
-
+        
         Ok(Self {
-            storage_path: storage_path.into(),
+            storage_path,
             acceptor,
         })
     }
@@ -229,6 +302,23 @@ impl BackupServer {
                 }
                 BackupMessage::Complete { hash, chunks_count } => {
                     if let Some(session) = session.take() {
+                        // Verify the client-provided hash matches what we expect
+                        if hash != session.file_operation.expected_hash {
+                            warn!(
+                                "File hash mismatch: client reported {}, but expected {}",
+                                hash, session.file_operation.expected_hash
+                            );
+                            send_message(
+                                &mut stream,
+                                &ServerResponse::Error(format!(
+                                    "Hash mismatch: expected {}, got {}",
+                                    session.file_operation.expected_hash, hash
+                                )),
+                            )
+                            .await?;
+                            continue;
+                        }
+
                         if session.file_operation.chunks.len() as u64 != chunks_count {
                             warn!(
                             "Chunks count mismatch: client reported {} chunks, but server received {}",
