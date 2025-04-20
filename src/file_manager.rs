@@ -1,10 +1,9 @@
-use tracing::{debug, error};
-use anyhow::{Result, Context};
-use sha2::{Sha256, Digest};
-use std::path::Path;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Seek};
-use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct FileInfo {
@@ -18,14 +17,14 @@ impl FileInfo {
         let mut file = File::open(path)?;
         let metadata = file.metadata()?;
         let size = metadata.len();
-        
+
         // Calculate SHA-256 hash
         let mut hasher = Sha256::new();
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
         hasher.update(&buffer);
         let hash = format!("{:x}", hasher.finalize());
-        
+
         Ok(FileInfo {
             path: path.to_string_lossy().into_owned(),
             hash,
@@ -52,7 +51,8 @@ pub fn read_file_chunk(path: &Path, start: u64, size: usize) -> Result<Vec<u8>> 
     file.seek(std::io::SeekFrom::Start(start))?;
 
     let mut buffer = vec![0u8; size];
-    file.read_exact(&mut buffer).context("Failed to read file chunk")?;
+    file.read_exact(&mut buffer)
+        .context("Failed to read file chunk")?;
 
     Ok(buffer)
 }

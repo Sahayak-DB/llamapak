@@ -1,10 +1,9 @@
-use tempfile;
 use crate::logger::LoggerConfig;
+use tempfile;
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tempfile::TempDir;
     use crate::logger::initialize_logging;
+    use tempfile::TempDir;
 
     #[test]
     fn test_logger_initialization() {
@@ -16,10 +15,10 @@ mod tests {
             max_files: 5,
             json_format: false,
         };
-        
+
         let result = initialize_logging(config);
         assert!(result.is_ok());
-        
+
         // Add assertions to verify log files are created
     }
 
