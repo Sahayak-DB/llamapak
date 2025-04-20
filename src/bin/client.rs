@@ -3,20 +3,18 @@ use iced::theme::Theme::{SolarizedDark, SolarizedLight};
 use iced::widget::{button, column, container, row, text};
 use iced::window::Position;
 use iced::{Application, Command, Element, Length, Settings, Size, Theme};
-use llamapak::tls_client::TlsClient;
-use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::{rustls, TlsConnector};
 
 use tracing::{debug, error, info, warn};
 
 use llamapak::{
+    calculate_hash,
     logger::{initialize_logging, LoggerConfig},
-    AppError, BackupMessage, BackupRequest, FileInfo, ServerResponse,
+    receive_message, send_message, BackupMessage, BackupRequest, ChunkedFileOperation,
+    ConnectionConfig, FileInfo, ServerResponse, DEFAULT_CHUNK_SIZE,
 };
 
 #[derive(Debug, Clone)]
@@ -31,6 +29,20 @@ enum Message {
     ChunkSent(Result<(), String>),
     BackupCompleted(Result<bool, String>),
     ConnectionError(String),
+}
+// TODO: Pseudo-code for future client implementation
+struct FileDownloadOperation {
+    file_operation: ChunkedFileOperation,
+}
+
+impl FileDownloadOperation {
+    async fn receive_chunk(&mut self, offset: u64, data: Vec<u8>, chunk_hash: String) -> bool {
+        self.file_operation.add_chunk(offset, data, chunk_hash)
+    }
+
+    async fn complete_download(&self) -> Result<bool> {
+        self.file_operation.save_to_file().await
+    }
 }
 
 #[derive(Default, Clone)]
@@ -49,7 +61,11 @@ struct BackupClient {
 }
 impl BackupClient {
     pub fn new(server_address: String, server_port: u16) -> Self {
-        // Example data - replace with real data in your implementation
+        let config = ConnectionConfig {
+            server_address,
+            server_port,
+        };
+
         let example_operations = vec![
             OperationLog {
                 timestamp: "2024-03-20 12:00".to_string(),
@@ -86,14 +102,15 @@ impl BackupClient {
             space_available: 1024 * 1024 * 1000,
             schedule: "Daily at 11:30".to_string(),
             should_exit: false, // Initialize the new field
-            server_address: server_address,
-            server_port: server_port,
+            server_address: config.server_address,
+            server_port: config.server_port,
             connector: None,
         }
     }
     pub fn should_exit(&self) -> bool {
         self.should_exit
     }
+
     pub async fn initialize(&mut self) -> Result<()> {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
@@ -104,9 +121,9 @@ impl BackupClient {
             )
         }));
 
-        let server_cert = tokio::fs::read("cert.pem").await?;
-        let mut server_cert =
-            rustls_pemfile::certs(&mut server_cert.as_slice()).collect::<Result<Vec<_>, _>>()?;
+        let server_cert_from_file = tokio::fs::read("cert.pem").await?;
+        let server_cert = rustls_pemfile::certs(&mut server_cert_from_file.as_slice())
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Add the server certificate to the root store
         for cert in server_cert {
@@ -138,41 +155,6 @@ impl BackupClient {
 
         Ok(tls_stream)
     }
-    async fn send_message<T: Serialize>(
-        &self,
-        stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
-        message: &T,
-    ) -> Result<()> {
-        let data = serde_json::to_vec(message)?;
-        let len = data.len() as u32;
-
-        // Send message length first
-        stream.write_all(&len.to_be_bytes()).await?;
-
-        // Then send the actual message
-        stream.write_all(&data).await?;
-        stream.flush().await?;
-
-        Ok(())
-    }
-
-    async fn receive_response(
-        &self,
-        stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
-    ) -> Result<ServerResponse> {
-        // Read message length
-        let mut len_bytes = [0u8; 4];
-        stream.read_exact(&mut len_bytes).await?;
-        let len = u32::from_be_bytes(len_bytes);
-
-        // Read message data
-        let mut buffer = vec![0u8; len as usize];
-        stream.read_exact(&mut buffer).await?;
-
-        // Deserialize response
-        let response: ServerResponse = serde_json::from_slice(&buffer)?;
-        Ok(response)
-    }
     pub async fn start_backup(&self, file_path: &Path) -> Result<()> {
         let mut stream = self.connect().await?;
 
@@ -181,15 +163,9 @@ impl BackupClient {
         let file_size = file_content.len() as u64;
 
         // Calculate the file hash
-        let file_hash = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(&file_content);
-            format!("{:x}", hasher.finalize())
-        };
+        let file_hash = calculate_hash(&file_content);
 
-        // Define chunk size (e.g., 1MB)
-        let chunk_size = 1024 * 1024;
+        let requested_chunk_size = DEFAULT_CHUNK_SIZE;
 
         // Create backup request
         let request = BackupRequest {
@@ -198,18 +174,24 @@ impl BackupClient {
                 hash: file_hash.clone(),
                 size: file_size,
             },
-            chunk_size,
+            chunk_size: requested_chunk_size,
         };
 
         // Send init backup message
         let init_message = BackupMessage::InitBackup(request);
-        self.send_message(&mut stream, &init_message).await?;
+        send_message(&mut stream, &init_message).await?;
 
-        // Wait for server ready response
-        let response = self.receive_response(&mut stream).await?;
-        match response {
-            ServerResponse::Ready => {
-                info!("Server ready to receive backup");
+        // Wait for server ready response with negotiated chunk size
+        let response = receive_message::<ServerResponse, _>(&mut stream).await?;
+        let actual_chunk_size = match response {
+            ServerResponse::Ready {
+                negotiated_chunk_size,
+            } => {
+                info!(
+                    "Server ready to receive backup with chunk size: {} bytes",
+                    negotiated_chunk_size
+                );
+                negotiated_chunk_size
             }
             ServerResponse::Error(msg) => {
                 return Err(anyhow::anyhow!("Server error: {}", msg));
@@ -217,19 +199,15 @@ impl BackupClient {
             _ => {
                 return Err(anyhow::anyhow!("Unexpected server response"));
             }
-        }
+        };
 
         // Split file into chunks and send each chunk
         let mut chunks_count = 0;
-        for (i, chunk) in file_content.chunks(chunk_size as usize).enumerate() {
-            let offset = i as u64 * chunk_size;
+        for (i, chunk) in file_content.chunks(actual_chunk_size as usize).enumerate() {
+            let offset = i as u64 * actual_chunk_size;
 
             // Calculate chunk hash
-            let chunk_hash = {
-                let mut hasher = Sha256::new();
-                hasher.update(chunk);
-                format!("{:x}", hasher.finalize())
-            };
+            let chunk_hash = calculate_hash(chunk);
 
             // Send chunk
             let chunk_message = BackupMessage::ChunkData {
@@ -238,10 +216,10 @@ impl BackupClient {
                 chunk_hash: chunk_hash.clone(),
             };
 
-            self.send_message(&mut stream, &chunk_message).await?;
+            send_message(&mut stream, &chunk_message).await?;
 
             // Wait for chunk receipt confirmation
-            let response = self.receive_response(&mut stream).await?;
+            let response = receive_message::<ServerResponse, _>(&mut stream).await?;
             match response {
                 ServerResponse::ChunkReceived {
                     offset: resp_offset,
@@ -281,10 +259,10 @@ impl BackupClient {
             chunks_count,
         };
 
-        self.send_message(&mut stream, &complete_message).await?;
+        send_message(&mut stream, &complete_message).await?;
 
         // Wait for completion confirmation
-        let response = self.receive_response(&mut stream).await?;
+        let response = receive_message::<ServerResponse, _>(&mut stream).await?;
         match response {
             ServerResponse::BackupComplete { verified } => {
                 if verified {
@@ -525,20 +503,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Client application completed successfully");
     Ok(())
-}
-fn start_backup_command(backup_path: String) -> iced::Command<Message> {
-    iced::Command::perform(
-        async move {
-            // This will be executed in a background task
-            let mut client = BackupClient::new(String::from("localhost"), 3000);
-            match client.initialize().await {
-                Ok(_) => match client.start_backup(Path::new(&backup_path)).await {
-                    Ok(_) => Message::BackupInitiated(Ok(())),
-                    Err(e) => Message::BackupFailed(e.to_string()),
-                },
-                Err(e) => Message::BackupFailed(format!("Failed to initialize client: {}", e)),
-            }
-        },
-        |msg| msg,
-    )
 }

@@ -1,15 +1,11 @@
 use anyhow::{Context, Result};
 use rcgen::{
-    Certificate, CertificateParams, DistinguishedName, DnType, KeyPair, SanType,
-    PKCS_ECDSA_P256_SHA256,
+    Certificate, CertificateParams, DistinguishedName, DnType, SanType, PKCS_ECDSA_P256_SHA256,
 };
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::io::{BufReader, Seek};
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
@@ -17,51 +13,45 @@ use tracing::{debug, error, info, warn};
 // Import from the library crate
 use llamapak::{
     logger::{initialize_logging, LoggerConfig},
-    BackupMessage, ChunkInfo, ServerResponse,
+    negotiate_chunk_size, receive_message, send_message, BackupMessage, ChunkedFileOperation,
+    ServerResponse,
 };
 
 struct BackupSession {
-    file_path: PathBuf,
-    expected_hash: String,
-    expected_size: u64,
-    chunks: HashMap<u64, ChunkInfo>,
-    chunk_size: u64,
+    file_operation: ChunkedFileOperation,
 }
 
 impl BackupSession {
     fn new(file_path: PathBuf, expected_hash: String, expected_size: u64, chunk_size: u64) -> Self {
         Self {
-            file_path,
-            expected_hash,
-            expected_size,
-            chunks: HashMap::new(),
-            chunk_size,
+            file_operation: ChunkedFileOperation::new(
+                file_path,
+                expected_hash,
+                expected_size,
+                chunk_size,
+            ),
         }
     }
 
-    fn calculate_chunk_hash(data: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        format!("{:x}", hasher.finalize())
-    }
-
     fn verify_chunk(&mut self, offset: u64, data: Vec<u8>, chunk_hash: String) -> bool {
-        let calculated_hash = Self::calculate_chunk_hash(&data);
-        let verified = calculated_hash == chunk_hash;
-
-        if verified {
-            self.chunks.insert(
-                offset,
-                ChunkInfo {
-                    hash: chunk_hash,
-                    verified: true,
-                    data,
-                },
-            );
-        } else {
+        // Validate offset
+        if !self.file_operation.validate_chunk_offset(offset) {
             warn!(
-                "Chunk hash mismatch at offset {}. Expected: {}, Got: {}",
-                offset, chunk_hash, calculated_hash
+                "Chunk offset {} is not aligned with negotiated chunk size {}",
+                offset, self.file_operation.chunk_size
+            );
+            return false;
+        }
+
+        // Add the chunk
+        let verified = self
+            .file_operation
+            .add_chunk(offset, data, chunk_hash.clone());
+
+        if !verified {
+            warn!(
+                "Chunk verification failed: offset={}, hash={}",
+                offset, chunk_hash
             );
         }
 
@@ -69,77 +59,31 @@ impl BackupSession {
     }
 
     async fn save_file(&self) -> Result<bool> {
-        if !self.verify_complete() {
-            return Ok(false);
-        }
-
-        // Ensure the directory exists
-        if let Some(parent) = self.file_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        let mut file = tokio::fs::File::create(&self.file_path).await?;
-        let mut current_offset = 0u64;
-
-        // Write chunks in order
-        while let Some(chunk) = self.chunks.get(&current_offset) {
-            file.write_all(&chunk.data).await?;
-            current_offset += chunk.data.len() as u64;
-        }
-
-        // Verify final file
-        let final_hash = self.calculate_file_hash().await?;
-        let hash_matches = final_hash == self.expected_hash;
-
-        // Add detailed logging about file verification
-        if hash_matches {
-            info!(
-                "File saved successfully at '{}' and hash verified: {} (size: {} bytes)",
-                self.file_path.display(),
-                final_hash,
-                self.expected_size
-            );
-        } else {
-            warn!(
-                "File hash verification FAILED for '{}'. Expected: {}, Got: {}",
-                self.file_path.display(),
-                self.expected_hash,
-                final_hash
-            );
-        }
-
-        Ok(hash_matches)
-    }
-
-    async fn calculate_file_hash(&self) -> Result<String> {
-        let mut hasher = Sha256::new();
-        let mut file = tokio::fs::File::open(&self.file_path).await?;
-        let mut buffer = vec![0u8; 8192];
-
-        loop {
-            let bytes_read = file.read(&mut buffer).await?;
-            if bytes_read == 0 {
-                break;
+        // Use the common implementation
+        match self.file_operation.save_to_file().await {
+            Ok(verified) => {
+                if verified {
+                    info!(
+                        "File saved successfully at '{}' and hash verified",
+                        self.file_operation.file_path.display()
+                    );
+                } else {
+                    warn!(
+                        "File hash verification FAILED for '{}'",
+                        self.file_operation.file_path.display()
+                    );
+                }
+                Ok(verified)
             }
-            hasher.update(&buffer[..bytes_read]);
-        }
-
-        Ok(format!("{:x}", hasher.finalize()))
-    }
-
-    fn verify_complete(&self) -> bool {
-        let mut current_offset = 0u64;
-        let mut total_size = 0u64;
-
-        while let Some(chunk) = self.chunks.get(&current_offset) {
-            if !chunk.verified {
-                return false;
+            Err(e) => {
+                error!(
+                    "Error saving file '{}': {}",
+                    self.file_operation.file_path.display(),
+                    e
+                );
+                Err(e)
             }
-            total_size += chunk.data.len() as u64;
-            current_offset += chunk.data.len() as u64;
         }
-
-        total_size == self.expected_size
     }
 }
 
@@ -208,47 +152,60 @@ impl BackupServer {
         let mut session: Option<BackupSession> = None;
 
         loop {
-            // Read message length
-            let mut len_bytes = [0u8; 4];
-            if stream.read_exact(&mut len_bytes).await.is_err() {
-                break; // Client disconnected
-            }
-            let len = u32::from_be_bytes(len_bytes);
-
-            // Read message
-            let mut buffer = vec![0u8; len as usize];
-            stream.read_exact(&mut buffer).await?;
-
-            let message: BackupMessage = serde_json::from_slice(&buffer)?;
+            // Read message using the existing receive_message function
+            let message = match receive_message::<BackupMessage, _>(&mut stream).await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                        if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
+                            // Client disconnected
+                            break;
+                        }
+                    }
+                    return Err(e);
+                }
+            };
 
             match message {
                 BackupMessage::InitBackup(request) => {
                     let file_path = storage_path.join(&request.file_info.path);
+                    // Negotiate the chunk size
+                    let requested_chunk_size = request.chunk_size;
+                    let negotiated_chunk_size = negotiate_chunk_size(requested_chunk_size);
+
+                    // Create session with negotiated chunk size, not requested chunk size
                     session = Some(BackupSession::new(
                         file_path.clone(),
                         request.file_info.hash.clone(),
                         request.file_info.size,
-                        request.chunk_size,
+                        negotiated_chunk_size, // Use negotiated size here
                     ));
+
                     info!(
-                        "Received backup request: file '{}', size: {} bytes, hash: {}, chunk size: {} bytes",
-                        format!("{}", file_path.display()),
-                        request.file_info.size,
-                        request.file_info.hash,
-                        request.chunk_size,
-                    );
+                    "Received backup request: file '{}', size: {} bytes, hash: {}, chunk size: {} bytes",
+                    format!("{}", file_path.display()),
+                    request.file_info.size,
+                    request.file_info.hash,
+                    negotiated_chunk_size, // Use negotiated size in log
+                );
 
-                    Self::send_response(&mut stream, ServerResponse::Ready).await?;
+                    send_message(
+                        &mut stream,
+                        &ServerResponse::Ready {
+                            negotiated_chunk_size,
+                        },
+                    )
+                    .await?;
                 }
-
                 BackupMessage::ChunkData {
                     offset,
                     data,
                     chunk_hash,
                 } => {
                     if let Some(session) = session.as_mut() {
-                        // Check if the offset is at a 1MB interval
-                        if (offset % 1048576 == 0) {
+                        // Check if the offset is at a negotiated_chunk_size interval
+                        // Use the session's actual chunk size from file_operation
+                        if offset % session.file_operation.chunk_size == 0 {
                             info!(
                                 "Received chunk at offset={}, size={} bytes, hash={}",
                                 offset,
@@ -256,101 +213,77 @@ impl BackupServer {
                                 chunk_hash
                             );
                         }
-
                         let verified = session.verify_chunk(offset, data, chunk_hash);
-                        Self::send_response(
+                        send_message(
                             &mut stream,
-                            ServerResponse::ChunkReceived { offset, verified },
+                            &ServerResponse::ChunkReceived { offset, verified },
                         )
                         .await?;
                     } else {
-                        Self::send_response(
+                        send_message(
                             &mut stream,
-                            ServerResponse::Error("No active backup session".to_string()),
+                            &ServerResponse::Error("No active backup session".to_string()),
                         )
                         .await?;
                     }
                 }
-
                 BackupMessage::Complete { hash, chunks_count } => {
                     if let Some(session) = session.take() {
-                        if session.chunks.len() as u64 != chunks_count {
+                        if session.file_operation.chunks.len() as u64 != chunks_count {
                             warn!(
-                                "Chunks count mismatch: client reported {} chunks, but server received {}",
-                                chunks_count,
-                                session.chunks.len()
-                            );
-
-                            Self::send_response(
+                            "Chunks count mismatch: client reported {} chunks, but server received {}",
+                            chunks_count,
+                            session.file_operation.chunks.len()
+                        );
+                            send_message(
                                 &mut stream,
-                                ServerResponse::Error(format!(
+                                &ServerResponse::Error(format!(
                                     "Expected {} chunks, got {}",
                                     chunks_count,
-                                    session.chunks.len()
+                                    session.file_operation.chunks.len()
                                 )),
                             )
                             .await?;
                             continue;
                         }
-
                         match session.save_file().await {
                             Ok(verified) => {
                                 if verified {
                                     info!(
-                                        "Backup completed successfully: file hash verified for '{}'",
-                                        session.file_path.display()
-                                    );
+                                    "Backup completed successfully: file hash verified for '{}'",
+                                    session.file_operation.file_path.display()
+                                );
                                 } else {
                                     warn!(
                                         "Backup hash verification failed for '{}'",
-                                        session.file_path.display()
+                                        session.file_operation.file_path.display()
                                     );
                                 }
-                                Self::send_response(
+                                send_message(
                                     &mut stream,
-                                    ServerResponse::BackupComplete { verified },
-                                )
-                                .await?;
-                            }
-                            Err(e) => {
-                                Self::send_response(
-                                    &mut stream,
-                                    ServerResponse::Error(format!("Failed to save file: {}", e)),
+                                    &ServerResponse::BackupComplete { verified },
                                 )
                                 .await?;
                             }
                             Err(e) => {
                                 error!("Failed to save file: {}", e);
-                                Self::send_response(
+                                send_message(
                                     &mut stream,
-                                    ServerResponse::Error(format!("Failed to save file: {}", e)),
+                                    &ServerResponse::Error(format!("Failed to save file: {}", e)),
                                 )
-                                    .await?;
+                                .await?;
                             }
                         }
                     } else {
-                        Self::send_response(
+                        send_message(
                             &mut stream,
-                            ServerResponse::Error("No active backup session".to_string()),
+                            &ServerResponse::Error("No active backup session".to_string()),
                         )
                         .await?;
                     }
                 }
             }
         }
-
-        Ok(())
-    }
-
-    async fn send_response(
-        stream: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-        response: ServerResponse,
-    ) -> Result<()> {
-        let data = serde_json::to_vec(&response)?;
-        let len = data.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(&data).await?;
-        stream.flush().await?;
         Ok(())
     }
 }

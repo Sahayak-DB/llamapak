@@ -1,21 +1,46 @@
-use crate::{BackupMessage, BackupRequest, FileInfo, ServerResponse};
-use anyhow::{Context, Result};
-use rustls::{ClientConfig, RootCertStore};
-use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use crate::{
+    calculate_hash, receive_message, send_message, BackupMessage, BackupRequest, ConnectionConfig,
+    FileInfo, ServerResponse, DEFAULT_CHUNK_SIZE,
+};
+use anyhow::Result;
+use rustls::ServerName;
+use rustls::{Certificate, ClientConfig, RootCertStore};
+use rustls_pemfile;
+use sha2::Digest;
+use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
 use tokio_rustls::{rustls, TlsConnector};
 use tracing::{debug, info, warn};
 
+/// A client for secure file operations over TLS
 pub struct TlsClient {
     connector: TlsConnector,
+    connection_config: ConnectionConfig,
 }
 
 impl TlsClient {
-    pub fn new() -> Result<Self> {
+    /// Create a new TLS client with the given configuration
+    pub fn new(connection_config: ConnectionConfig) -> Self {
+        let connector = TlsConnector::from(Arc::new(
+            ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth(),
+        ));
+
+        Self {
+            connector,
+            connection_config,
+        }
+    }
+    /// Initialize the TLS client with the required certificates
+    pub async fn initialize(&mut self, cert_path: Option<&Path>) -> Result<()> {
         let mut root_store = RootCertStore::empty();
+
+        // Add system root certificates
         root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
             rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
                 ta.subject,
@@ -24,160 +49,88 @@ impl TlsClient {
             )
         }));
 
-        let config = rustls::ClientConfig::builder()
+        // Add custom certificate if provided
+        if let Some(path) = cert_path {
+            let server_cert = tokio::fs::read(path).await?;
+            let certs = rustls_pemfile::certs(&mut server_cert.as_slice())
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for cert in certs {
+                root_store.add(&Certificate(cert.to_vec()))?;
+            }
+        }
+
+        let config = ClientConfig::builder()
             .with_safe_defaults()
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
-        // Note: TLS 1.3 is enabled by default with safe_defaults()
-        let connector = TlsConnector::from(Arc::new(config));
-
-        Ok(TlsClient { connector })
+        self.connector = TlsConnector::from(Arc::new(config));
+        Ok(())
     }
 
-    pub async fn connect(
+    /// Connect to the server
+    pub async fn connect(&self) -> Result<TlsStream<TcpStream>> {
+        let server_addr = format!(
+            "{}:{}",
+            self.connection_config.server_address, self.connection_config.server_port
+        );
+
+        info!("Connecting to server at {}", server_addr);
+
+        let stream = TcpStream::connect(&server_addr).await?;
+        let domain = ServerName::try_from(self.connection_config.server_address.as_str())?;
+
+        let tls_stream = self.connector.connect(domain, stream).await?;
+        info!("TLS connection established");
+
+        Ok(tls_stream)
+    }
+    /// Send a file to the server
+    pub async fn send_file(
         &self,
-        server_name: &str,
-        addr: &str,
-    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-        let stream = TcpStream::connect(addr).await?;
-        let domain = rustls::ServerName::try_from(server_name)?;
+        file_path: &Path,
+        preferred_chunk_size: Option<u64>,
+    ) -> Result<bool> {
+        let mut stream = self.connect().await?;
 
-        let stream = self.connector.connect(domain, stream).await?;
-        Ok(stream)
-    }
-}
+        // Get file metadata instead of reading the whole file
+        let file_metadata = tokio::fs::metadata(file_path).await?;
+        let file_size = file_metadata.len();
 
-pub async fn connect_to_server(
-    server_addr: &str,
-) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
-    // Load root certificates
-    let mut root_store = RootCertStore::empty();
+        // Request chunk size (use default if not specified)
+        let requested_chunk_size = preferred_chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
 
-    // For development, you might want to accept self-signed certs
-    let config = ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+        // We'll calculate the file hash during chunking
+        // Read a small portion of the file to verify it exists and is readable
+        let _ = tokio::fs::File::open(file_path).await?;
 
-    let connector = TlsConnector::from(std::sync::Arc::new(config));
-    let server_name = rustls::ServerName::try_from("localhost")?;
-
-    let stream = tokio::net::TcpStream::connect(server_addr).await?;
-    let stream = connector.connect(server_name, stream).await?;
-
-    Ok(stream)
-}
-
-pub async fn backup_file(file_path: PathBuf, server_addr: &str, chunk_size: u64) -> Result<bool> {
-    // Connect to server
-    let mut stream = connect_to_server(server_addr).await?;
-
-    // Read the file and get metadata
-    let file_content = tokio::fs::read(&file_path)
-        .await
-        .context(format!("Failed to read file: {:?}", file_path))?;
-    let file_size = file_content.len() as u64;
-
-    // Calculate the file hash
-    let file_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(&file_content);
-        format!("{:x}", hasher.finalize())
-    };
-
-    debug!(
-        "Backing up file: {:?}, size: {}, hash: {}",
-        file_path, file_size, file_hash
-    );
-
-    // Create backup request
-    let request = BackupRequest {
-        file_info: FileInfo {
-            path: file_path.clone(),
-            hash: file_hash.clone(),
-            size: file_size,
-        },
-        chunk_size,
-    };
-
-    // Send init backup message
-    let init_message = BackupMessage::InitBackup(request);
-    send_message(&mut stream, &init_message)
-        .await
-        .context("Failed to send backup initialization message")?;
-
-    // Wait for server ready response
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        receive_response(&mut stream),
-    )
-    .await
-    .context("Timed out waiting for server response")?
-    .context("Failed to receive server response")?;
-
-    match response {
-        ServerResponse::Ready => {
-            info!("Server ready to receive backup");
-        }
-        ServerResponse::Error(msg) => {
-            return Err(anyhow::anyhow!("Server error: {}", msg));
-        }
-        _ => {
-            return Err(anyhow::anyhow!("Unexpected server response"));
-        }
-    }
-
-    // Split file into chunks and send each chunk
-    let mut chunks_count = 0;
-    for (i, chunk) in file_content.chunks(chunk_size as usize).enumerate() {
-        let offset = i as u64 * chunk_size;
-
-        // Calculate chunk hash
-        let chunk_hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(chunk);
-            format!("{:x}", hasher.finalize())
+        // Create backup request
+        let request = BackupRequest {
+            file_info: FileInfo {
+                path: file_path.to_path_buf(),
+                hash: String::new(), // We'll calculate the real hash during chunking
+                size: file_size,
+            },
+            chunk_size: requested_chunk_size,
         };
 
-        // Send chunk
-        let chunk_message = BackupMessage::ChunkData {
-            offset,
-            data: chunk.to_vec(),
-            chunk_hash: chunk_hash.clone(),
-        };
+        // Send initialization request
+        let init_message = BackupMessage::InitBackup(request);
+        send_message(&mut stream, &init_message).await?;
 
-        send_message(&mut stream, &chunk_message)
-            .await
-            .context(format!("Failed to send chunk at offset {}", offset))?;
-
-        // Wait for chunk receipt confirmation
-        let response = receive_response(&mut stream).await.context(format!(
-            "Failed to receive response for chunk at offset {}",
-            offset
-        ))?;
-
-        match response {
-            ServerResponse::ChunkReceived {
-                offset: resp_offset,
-                verified,
+        // Get negotiated chunk size from server
+        let response = receive_message::<ServerResponse, _>(&mut stream).await?;
+        let actual_chunk_size = match response {
+            ServerResponse::Ready {
+                negotiated_chunk_size,
             } => {
-                if resp_offset != offset {
-                    return Err(anyhow::anyhow!(
-                        "Server acknowledged wrong chunk offset: {} (expected {})",
-                        resp_offset,
-                        offset
-                    ));
-                }
-
-                if !verified {
-                    return Err(anyhow::anyhow!(
-                        "Chunk verification failed at offset {}",
-                        offset
-                    ));
-                }
-
-                debug!("Chunk at offset {} verified successfully", offset);
+                info!(
+                    "Server ready to receive file '{}' with chunk size: {} bytes",
+                    file_path.display(),
+                    negotiated_chunk_size
+                );
+                negotiated_chunk_size
             }
             ServerResponse::Error(msg) => {
                 return Err(anyhow::anyhow!("Server error: {}", msg));
@@ -185,106 +138,127 @@ pub async fn backup_file(file_path: PathBuf, server_addr: &str, chunk_size: u64)
             _ => {
                 return Err(anyhow::anyhow!("Unexpected server response"));
             }
+        };
+
+        // Process file in chunks
+        let mut file = tokio::fs::File::open(file_path).await?;
+        let mut buffer = vec![0u8; actual_chunk_size as usize];
+        let mut offset = 0u64;
+        let mut hasher = sha2::Sha256::new();
+        let mut chunks_count = 0u64;
+
+        // Read and process each chunk
+        loop {
+            let bytes_read = file.read(&mut buffer).await?;
+            if bytes_read == 0 {
+                break; // End of file
+            }
+
+            // Update the file hash
+            hasher.update(&buffer[..bytes_read]);
+
+            // Calculate chunk hash
+            let chunk_hash = calculate_hash(&buffer[..bytes_read]);
+
+            // Send chunk
+            let chunk_message = BackupMessage::ChunkData {
+                offset,
+                data: buffer[..bytes_read].to_vec(),
+                chunk_hash: chunk_hash.clone(),
+            };
+            send_message(&mut stream, &chunk_message).await?;
+
+            // Wait for chunk receipt confirmation
+            let response = receive_message::<ServerResponse, _>(&mut stream).await?;
+            match response {
+                ServerResponse::ChunkReceived {
+                    offset: resp_offset,
+                    verified,
+                } => {
+                    if resp_offset != offset {
+                        return Err(anyhow::anyhow!(
+                            "Server acknowledged wrong chunk offset: {} (expected {})",
+                            resp_offset,
+                            offset
+                        ));
+                    }
+                    if !verified {
+                        return Err(anyhow::anyhow!(
+                            "Chunk verification failed at offset {}",
+                            offset
+                        ));
+                    }
+                    // Log only at specific intervals to avoid excessive logging
+                    if offset % (actual_chunk_size * 10) == 0 || offset == 0 {
+                        info!(
+                            "Chunk at offset {} verified successfully ({} bytes)",
+                            offset, bytes_read
+                        );
+                    }
+                }
+                ServerResponse::Error(msg) => {
+                    return Err(anyhow::anyhow!("Server error: {}", msg));
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Unexpected server response"));
+                }
+            }
+
+            offset += bytes_read as u64;
+            chunks_count += 1;
         }
 
-        chunks_count += 1;
-    }
+        // Get the final file hash
+        let file_hash = format!("{:x}", hasher.finalize());
 
-    // Send completion message
-    let complete_message = BackupMessage::Complete {
-        hash: file_hash,
-        chunks_count,
+        // Send completion message
+        let complete_message = BackupMessage::Complete {
+            hash: file_hash.clone(),
+            chunks_count,
+        };
+        send_message(&mut stream, &complete_message).await?;
+
+        // Wait for completion confirmation
+        let response = receive_message::<ServerResponse, _>(&mut stream).await?;
+        match response {
+            ServerResponse::BackupComplete { verified } => {
+                if verified {
+                    info!(
+                        "File '{}' sent and verified successfully",
+                        file_path.display()
+                    );
+                    Ok(true)
+                } else {
+                    warn!(
+                        "File '{}' sent but verification failed",
+                        file_path.display()
+                    );
+                    Ok(false)
+                }
+            }
+            ServerResponse::Error(msg) => {
+                Err(anyhow::anyhow!("Server error during completion: {}", msg))
+            }
+            _ => Err(anyhow::anyhow!(
+                "Unexpected server response during completion"
+            )),
+        }
+    }
+}
+
+// Convenience function to create and initialize a client with defaults
+pub async fn create_default_client(
+    server_address: String,
+    server_port: Option<u16>,
+    cert_path: Option<&Path>,
+) -> Result<TlsClient> {
+    let connection_config = ConnectionConfig {
+        server_address,
+        server_port: server_port.unwrap_or(crate::DEFAULT_PORT),
     };
 
-    send_message(&mut stream, &complete_message)
-        .await
-        .context("Failed to send backup completion message")?;
+    let mut client = TlsClient::new(connection_config);
+    client.initialize(cert_path).await?;
 
-    // Wait for completion confirmation
-    let response = receive_response(&mut stream)
-        .await
-        .context("Failed to receive backup completion response")?;
-
-    match response {
-        ServerResponse::BackupComplete { verified } => {
-            if verified {
-                info!(
-                    "Backup of {:?} completed and verified successfully",
-                    file_path
-                );
-                Ok(true)
-            } else {
-                warn!(
-                    "Backup of {:?} completed but verification failed",
-                    file_path
-                );
-                Ok(false)
-            }
-        }
-        ServerResponse::Error(msg) => Err(anyhow::anyhow!("Server error: {}", msg)),
-        _ => Err(anyhow::anyhow!("Unexpected server response")),
-    }
-}
-
-/// Sends a serializable message to the TLS stream
-///
-/// This function serializes the message to JSON, prepends the length as a 4-byte
-/// big-endian integer, and writes the data to the stream.
-async fn send_message<T: serde::Serialize>(
-    stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-    message: &T,
-) -> Result<()> {
-    // Serialize the message to JSON
-    let data = serde_json::to_vec(message).context("Failed to serialize message")?;
-
-    // Get the length as u32 and convert to big-endian bytes
-    let len = data.len() as u32;
-    let len_bytes = len.to_be_bytes();
-
-    // Write the length header
-    stream
-        .write_all(&len_bytes)
-        .await
-        .context("Failed to write message length")?;
-
-    // Write the actual message data
-    stream
-        .write_all(&data)
-        .await
-        .context("Failed to write message data")?;
-
-    // Ensure all data is sent
-    stream.flush().await.context("Failed to flush stream")?;
-
-    Ok(())
-}
-/// Receives a response from the TLS stream
-///
-/// This function reads a 4-byte length header, then reads the corresponding
-/// number of bytes and deserializes them from JSON to a ServerResponse.
-async fn receive_response(
-    stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-) -> Result<ServerResponse> {
-    // Read message length (4 bytes)
-    let mut len_bytes = [0u8; 4];
-    stream
-        .read_exact(&mut len_bytes)
-        .await
-        .context("Failed to read message length")?;
-
-    // Convert bytes to u32 length
-    let len = u32::from_be_bytes(len_bytes);
-
-    // Read the message data
-    let mut buffer = vec![0u8; len as usize];
-    stream
-        .read_exact(&mut buffer)
-        .await
-        .context("Failed to read message data")?;
-
-    // Deserialize the message
-    let response: ServerResponse =
-        serde_json::from_slice(&buffer).context("Failed to deserialize server response")?;
-
-    Ok(response)
+    Ok(client)
 }
