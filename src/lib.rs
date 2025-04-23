@@ -1,5 +1,6 @@
 pub mod logger;
 pub mod tls_client;
+pub mod client_settings;
 
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
