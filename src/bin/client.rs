@@ -1,21 +1,20 @@
 use anyhow::{Context, Result};
 use iced::theme::Theme::{SolarizedDark, SolarizedLight};
-use iced::widget::{button, column, container, horizontal_rule, row, text, text_input, Space};
+use iced::widget::{button, column, container, horizontal_rule, row, text, text_input, Container, Space};
 use iced::window::Position;
 use iced::{Application, Command, Element, Length, Settings, Size, Theme};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio_rustls::{rustls, TlsConnector};
 use tokio_rustls::client::TlsStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use llamapak::{
     calculate_hash,
     client_settings::{ClientSettings, LogLevel, OperationStatus},
     logger::{initialize_logging, LoggerConfig},
     receive_message, send_message, BackupMessage, BackupRequest, ChunkedFileOperation,
-    ConnectionConfig, FileInfo, ServerResponse, DEFAULT_CHUNK_SIZE,
+    ConnectionConfig, FileInfo, ServerResponse,
 };
 use llamapak::client_settings::BackupPathEntry;
 use llamapak::tls_client::TlsClient;
@@ -149,10 +148,6 @@ impl BackupClient {
             file_pattern: String::new(),
 
         }
-    }
-    
-    pub fn should_exit(&self) -> bool {
-        self.should_exit
     }
 
     fn view_backup_paths(&self) -> Element<Message> {
@@ -351,7 +346,7 @@ impl BackupClient {
             // Back up the file
             self.backup_file_with_existing_connection(&mut stream, path.as_path()).await?;
         }
-        
+
         // Send disconnect message using helper function
         let disconnect_msg = BackupMessage::Disconnect {
             reason: "Backup session complete".to_string()
@@ -509,7 +504,7 @@ impl BackupClient {
             _ => Err(anyhow::anyhow!("Unexpected server response for file '{}'", file_path.display())),
         }
     }
-    
+
     /// Collect files from a directory with optional pattern matching
     fn collect_files_from_directory(
         &self,
@@ -602,7 +597,7 @@ impl Application for BackupClient {
             Message::SetBackupPath(path) => {
                 self.backup_path = path.clone();
                 // Update or add to backup_paths in settings
-                if let Some(entry) = self.settings.backup_paths.iter_mut().find(|e| e.path == path) {
+                if let Some(_) = self.settings.backup_paths.iter_mut().find(|e| e.path == path) {
                     // Path already exists in list
                 } else {
                     // Add as new backup path
@@ -639,7 +634,7 @@ impl Application for BackupClient {
                 let server_address = self.server_address.clone();
                 let settings = self.settings.clone();
                 let encryption_key = self.encryption_key;
-                
+
                 let mut backup_op_paths: Vec<PathBuf> = Vec::new();
 
                 for path_entry in backup_paths {
@@ -648,21 +643,21 @@ impl Application for BackupClient {
                     if path.is_dir() && path_entry.is_directory {
                         let files_to_add = self.collect_files_from_directory(
                             &path,
-                            path_entry.include_subdirectories, 
+                            path_entry.include_subdirectories,
                             path_entry.file_pattern.as_deref())
                             .expect("Unable to extract a file list.");
-                        
+
                         backup_op_paths.extend(files_to_add)
                     }
                     else {
                         backup_op_paths.extend(Vec::from([path]));
                     }
                 }
-                
+
                 Command::perform(
                     async move {
                         let mut errors = Vec::new();
-                        
+
                         match start_backup_async(backup_op_paths.clone(), server_address.clone(), settings.clone(), encryption_key).await {
                             Ok(_) => {},
                             Err(e) => errors.push(format!("Errors backing up: {}", e)),
@@ -691,7 +686,7 @@ impl Application for BackupClient {
                 );
                 
                 // Create a copy of the necessary data
-                let mut settings_copy = self.settings.clone();
+                let settings_copy = self.settings.clone();
                 let encryption_key = self.encryption_key;
                 
                 Command::perform(
@@ -719,7 +714,7 @@ impl Application for BackupClient {
                 self.show_settings = false; // Close settings panel
                 
                 // Create a copy of the necessary data
-                let mut settings_copy = self.settings.clone();
+                let settings_copy = self.settings.clone();
                 let encryption_key = self.encryption_key;
                 
                 Command::perform(
@@ -745,7 +740,7 @@ impl Application for BackupClient {
                 );
                 
                 // Create a copy of the necessary data
-                let mut settings_copy = self.settings.clone();
+                let settings_copy = self.settings.clone();
                 let encryption_key = self.encryption_key;
                 
                 Command::perform(
@@ -786,7 +781,7 @@ impl Application for BackupClient {
                 }
                 
                 // Create a copy of the necessary data
-                let mut settings_copy = self.settings.clone();
+                let settings_copy = self.settings.clone();
                 let encryption_key = self.encryption_key;
                 
                 Command::perform(
@@ -851,7 +846,6 @@ impl Application for BackupClient {
                 iced::Command::none()
             }
             Message::Quit => {
-                self.should_exit = true;
                 iced::Command::none()
             }
             Message::ConnectionError(error) => {
@@ -997,8 +991,10 @@ impl Application for BackupClient {
     fn view(&self) -> Element<Message> {
         if self.show_settings {
             // Settings view
-            let settings_form = column![
-                text("Client Settings").size(24),
+            let settings_form = iced::widget::scrollable(
+                column![
+                text("Client Settings")
+                    .size(24),
                 
                 // Backup Paths section
                 text("Backup Paths:").size(18),
@@ -1034,7 +1030,8 @@ impl Application for BackupClient {
                         ).on_press(Message::SetBackupPathIncludeSubdirs(!self.include_subdirectories)),
                     ].spacing(10)
                 } else {
-                    row![].spacing(0) // Empty row instead of container
+                    row![Container::new(Space::new(Length::Fill, Length::Fill))]
+                        
                 },
                 
                 // File pattern control (only visible for directory backups)
@@ -1070,24 +1067,22 @@ impl Application for BackupClient {
                 
                 // Theme settings
                 row![
-                    text("Dark Mode:").size(16),
-                    button(
-                        text(if self.settings.dark_mode { "On" } else { "Off" })
-                    ).on_press(Message::ToggleDarkMode),
-                ].spacing(10),
+                    iced::widget::toggler("Dark Mode".to_string(), self.settings.dark_mode, |_| Message::ToggleDarkMode)
+                        .size(16)
+                        .width(Length::Fill),
+                    ].spacing(10),
                 
                 // Save and cancel buttons
                 row![
                     button(text("Save Settings")).on_press(Message::SaveSettings),
                     button(text("Sync with Server")).on_press(Message::SyncSettings),
-                    button(text("Back")).on_press(Message::OpenSettings),  // Toggle back
                 ].spacing(10),
                 
                 // Status message
                 text(&self.status).size(16),
-            ]
-            .spacing(20)
-            .padding(20);
+                ].spacing(20).padding(20)
+            ).height(Length::Fill);
+
             
             container(settings_form)
                 .width(Length::Fill)
@@ -1214,9 +1209,12 @@ impl Application for BackupClient {
     
     fn theme(&self) -> Theme {
         if self.settings.dark_mode {
-            SolarizedDark
+            info!("Using Dark theme");
+            iced::Theme::Dark
+
         } else {
-            SolarizedLight
+            info!("Using Light theme");
+            iced::Theme::Light
         }
     }
 }

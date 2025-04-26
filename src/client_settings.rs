@@ -81,7 +81,7 @@ impl Default for ClientSettings {
             // Default GUI settings
             window_width: 1200,
             window_height: 1200,
-            dark_mode: true,
+            dark_mode: false,
             font_size: 12,
             auto_connect: true,
 
@@ -214,7 +214,7 @@ impl ClientSettings {
 }
 
     /// Synchronize settings with server
-    pub fn sync_with_server(&mut self, server_url: &str, encryption_key: &[u8; 32]) -> Result<()> {
+    pub fn sync_with_server(&mut self, _server_url: &str, encryption_key: &[u8; 32]) -> Result<()> {
         // This would use tls_client.rs to communicate with the server
         // First attempt to fetch settings from server
         // If successful, merge with local settings (giving preference to server settings)

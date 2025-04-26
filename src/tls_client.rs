@@ -18,7 +18,6 @@ use tracing::{debug, info, warn};
 /// A client for secure file operations over TLS
 pub struct TlsClient {
     connector: TlsConnector,
-    config: ClientConfig,
     connection_config: ConnectionConfig,
 }
 
@@ -35,7 +34,6 @@ impl TlsClient {
         Self {
             connector,
             connection_config,
-            config,
         }
     }
     /// Initialize the TLS client with the required certificates
@@ -522,8 +520,7 @@ impl TlsClient {
         include_subdirectories: bool,
         file_pattern: Option<&str>,
     ) -> Result<Vec<PathBuf>> {
-        use walkdir::{WalkDir, Error as WalkDirError};
-        use std::io::Error as IoError;
+        use walkdir::WalkDir;
 
         if !dir_path.exists() {
             return Err(anyhow::anyhow!("Directory does not exist: {}", dir_path.display()));
