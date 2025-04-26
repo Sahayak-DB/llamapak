@@ -102,9 +102,13 @@ impl BackupServer {
     ) -> Result<Self> {
         let storage_path = storage_path.into();
 
-        // Create a storage directory if it doesn't exist
-        std::fs::create_dir_all(&storage_path)
-            .with_context(|| format!("Failed to create storage directory at {}", storage_path.display()))?;
+        // Create storage directory if it doesn't exist
+        if !storage_path.exists() {
+            info!("Creating storage directory: {}", storage_path.display());
+            std::fs::create_dir_all(&storage_path)
+                .context("Failed to create storage directory")?;
+        }
+
 
         // Verify the storage directory is writable
         match tempfile_in(&storage_path) {
@@ -199,22 +203,30 @@ impl BackupServer {
         info!("Backup server listening on {}", addr);
 
         loop {
-            let (stream, peer_addr) = listener.accept().await?;
-            info!("New connection from {}", peer_addr);
+            match listener.accept().await {
+                Ok((stream, peer_addr)) => {
+                    info!("New connection from {}", peer_addr);
 
-            let acceptor = self.acceptor.clone();
-            let storage_path = self.storage_path.clone();
-
-            tokio::spawn(async move {
-                match acceptor.accept(stream).await {
-                    Ok(stream) => {
-                        if let Err(e) = Self::handle_client(stream, storage_path).await {
-                            error!("Error handling client {}: {}", peer_addr, e);
+                    let acceptor = self.acceptor.clone();
+                    let storage_path = self.storage_path.clone();
+                    
+                    tokio::spawn(async move {
+                        match acceptor.accept(stream).await {
+                            Ok(stream) => {
+                                if let Err(e) = Self::handle_client(stream, storage_path).await {
+                                    error!("Error handling client {}: {}", peer_addr, e);
+                                }
+                            }
+                            Err(e) => {
+                                error!("TLS error from {}: {}", peer_addr, e);
+                            }
                         }
-                    }
-                    Err(e) => error!("TLS error from {}: {}", peer_addr, e),
+                    });
                 }
-            });
+                Err(e) => {
+                    error!("Failed to accept connection: {}", e);
+                }
+            }
         }
     }
 
@@ -222,7 +234,7 @@ impl BackupServer {
         mut stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
         storage_path: PathBuf,
     ) -> Result<()> {
-        let mut session: Option<BackupSession> = None;
+        info!("Starting client session");
 
         loop {
             // Read message using the existing receive_message function
@@ -233,7 +245,7 @@ impl BackupServer {
                         if io_err.kind() == std::io::ErrorKind::UnexpectedEof || 
                            io_err.kind() == std::io::ErrorKind::ConnectionReset ||
                            io_err.kind() == std::io::ErrorKind::ConnectionAborted {
-                            info!("Client disconnected");
+                            info!("Client disconnected unexpectedly");
                             break;
                         }
                     }
@@ -249,7 +261,7 @@ impl BackupServer {
                     let negotiated_chunk_size = negotiate_chunk_size(requested_chunk_size);
 
                     // Create session with negotiated chunk size, not requested chunk size
-                    session = Some(BackupSession::new(
+                    let mut session = Some(BackupSession::new(
                         file_path.clone(),
                         request.file_info.hash.clone(),
                         request.file_info.size,
@@ -264,115 +276,152 @@ impl BackupServer {
                     negotiated_chunk_size, // Use negotiated size in log
                 );
 
-                    send_message(
-                        &mut stream,
-                        &ServerResponse::Ready {
-                            negotiated_chunk_size,
-                        },
-                    )
-                    .await?;
-                }
-                BackupMessage::ChunkData {
-                    offset,
-                    data,
-                    chunk_hash,
-                } => {
-                    if let Some(session) = session.as_mut() {
-                        // Check if the offset is at a negotiated_chunk_size interval
-                        // Use the session's actual chunk size from file_operation
-                        if offset % session.file_operation.chunk_size == 0 {
-                            info!(
-                                "Received chunk at offset={}, size={} bytes, hash={}",
-                                offset,
-                                data.len(),
-                                chunk_hash
-                            );
-                        }
-                        let verified = session.verify_chunk(offset, data, chunk_hash);
-                        send_message(
-                            &mut stream,
-                            &ServerResponse::ChunkReceived { offset, verified },
-                        )
-                        .await?;
-                    } else {
-                        send_message(
-                            &mut stream,
-                            &ServerResponse::Error("No active backup session".to_string()),
-                        )
-                        .await?;
-                    }
-                }
-                BackupMessage::Complete { hash, chunks_count } => {
-                    if let Some(session) = session.take() {
-                        // Verify the client-provided hash matches what we expect
-                        if hash != session.file_operation.expected_hash {
-                            warn!(
-                                "File hash mismatch: client reported {}, but expected {}",
-                                hash, session.file_operation.expected_hash
-                            );
-                            send_message(
-                                &mut stream,
-                                &ServerResponse::Error(format!(
-                                    "Hash mismatch: expected {}, got {}",
-                                    session.file_operation.expected_hash, hash
-                                )),
-                            )
-                            .await?;
-                            continue;
-                        }
+                    // Send ready response with negotiated chunk size
+                    let response = ServerResponse::Ready {
+                        negotiated_chunk_size: negotiated_chunk_size,
+                    };
+                    send_message(&mut stream, &response).await?;
 
-                        if session.file_operation.chunks.len() as u64 != chunks_count {
-                            warn!(
-                            "Chunks count mismatch: client reported {} chunks, but server received {}",
-                            chunks_count,
-                            session.file_operation.chunks.len()
-                        );
-                            send_message(
-                                &mut stream,
-                                &ServerResponse::Error(format!(
-                                    "Expected {} chunks, got {}",
-                                    chunks_count,
-                                    session.file_operation.chunks.len()
-                                )),
-                            )
-                            .await?;
-                            continue;
+                    // Create a path for the file within the storage directory
+                    let mut relative_path = request.file_info.path.clone();
+                    if relative_path.is_absolute() {
+                        // Extract the last component if the path is absolute
+                        if let Some(file_name) = relative_path.file_name() {
+                            relative_path = PathBuf::from(file_name);
                         }
-                        match session.save_file().await {
-                            Ok(verified) => {
-                                if verified {
+                    }
+                    // Create a new backup session
+                    let mut session = BackupSession::new(
+                        file_path,
+                        request.file_info.hash.clone(),
+                        request.file_info.size,
+                        negotiated_chunk_size,
+                    );
+                    // Process file chunks
+                    let mut expected_chunks = 0u64;
+                    let mut is_complete = false;
+
+                    while !is_complete {
+                        let message = receive_message::<BackupMessage, _>(&mut stream).await?;
+                        
+                        match message {
+                            BackupMessage::ChunkData {
+                                offset,
+                                data,
+                                chunk_hash,
+                            } => {
+                                // Check if the offset is at a negotiated_chunk_size interval
+                                // Use the session's actual chunk size from file_operation
+                                if offset % session.file_operation.chunk_size == 0 {
                                     info!(
-                                    "Backup completed successfully: file hash verified for '{}'",
-                                    session.file_operation.file_path.display()
-                                );
-                                } else {
-                                    warn!(
-                                        "Backup hash verification failed for '{}'",
-                                        session.file_operation.file_path.display()
+                                        "Received chunk at offset={}, size={} bytes, hash={}",
+                                        offset,
+                                        data.len(),
+                                        chunk_hash
                                     );
                                 }
+                                let verified = session.verify_chunk(offset, data, chunk_hash);
+                                
                                 send_message(
                                     &mut stream,
-                                    &ServerResponse::BackupComplete { verified },
+                                    &ServerResponse::ChunkReceived { offset, verified },
                                 )
-                                .await?;
+                                    .await?;
                             }
-                            Err(e) => {
-                                error!("Failed to save file: {}", e);
-                                send_message(
-                                    &mut stream,
-                                    &ServerResponse::Error(format!("Failed to save file: {}", e)),
-                                )
-                                .await?;
+                            BackupMessage::Complete {
+                                hash, 
+                                chunks_count 
+                            } => {
+                                    // Verify the client-provided hash matches what we expect
+                                    if hash != session.file_operation.expected_hash {
+                                        warn!(
+                                            "File hash mismatch: client reported {}, but expected {}",
+                                            hash, session.file_operation.expected_hash
+                                        );
+                                        send_message(
+                                            &mut stream,
+                                            &ServerResponse::Error(format!(
+                                                "Hash mismatch: expected {}, got {}",
+                                                session.file_operation.expected_hash, hash
+                                            )),
+                                        ).await?;
+                                    }
+
+                                    if session.file_operation.chunks.len() as u64 != chunks_count {
+                                        warn!(
+                                            "Chunks count mismatch: client reported {} chunks, but server received {}",
+                                            chunks_count,
+                                            session.file_operation.chunks.len()
+                                        );
+                                        send_message(
+                                            &mut stream,
+                                            &ServerResponse::Error(format!(
+                                                "Expected {} chunks, got {}",
+                                                chunks_count,
+                                                session.file_operation.chunks.len()
+                                            )),
+                                        )
+                                            .await?;
+                                        continue;
+                                    }
+                                    match session.save_file().await {
+                                        Ok(verified) => {
+                                            if verified {
+                                                info!(
+                                                    "Backup completed successfully: file hash verified for '{}'",
+                                                    session.file_operation.file_path.display()
+                                                );
+                                            } else {
+                                                warn!(
+                                                    "Backup hash verification failed for '{}'",
+                                                    session.file_operation.file_path.display()
+                                                );
+                                            }
+                                            send_message(
+                                                &mut stream,
+                                                &ServerResponse::BackupComplete { verified },
+                                            )
+                                                .await?;
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to save file: {}", e);
+                                            send_message(
+                                                &mut stream,
+                                                &ServerResponse::Error(format!("Failed to save file: {}", e)),
+                                            )
+                                                .await?;
+                                        }
+                                    }
                             }
+                            BackupMessage::Disconnect { reason } => {
+                                // Client is requesting to end the session early
+                                info!("Client requested disconnect during file transfer: {}", reason);
+                                let response = ServerResponse::DisconnectAck;
+                                send_message(&mut stream, &response).await?;
+                                return Ok(());
+                            }
+                            _ => {
+                                let error_msg = "Unexpected message type received".to_string();
+                                let response = ServerResponse::Error(error_msg.clone());
+                                send_message(&mut stream, &response).await?;
+                                return Err(anyhow::anyhow!(error_msg));
+                            }
+
                         }
-                    } else {
-                        send_message(
-                            &mut stream,
-                            &ServerResponse::Error("No active backup session".to_string()),
-                        )
-                        .await?;
                     }
+
+                }
+                BackupMessage::Disconnect { reason } => {
+                    info!("Client requested disconnect: {}", reason);
+                    let response = ServerResponse::DisconnectAck;
+                    send_message(&mut stream, &response).await?;
+                    return Ok(());
+                }
+                _ => {
+                    let error_msg = "Expected InitBackup or Disconnect message".to_string();
+                    let response = ServerResponse::Error(error_msg.clone());
+                    send_message(&mut stream, &response).await?;
+                    return Err(anyhow::anyhow!(error_msg));
                 }
             }
         }

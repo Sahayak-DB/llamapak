@@ -33,14 +33,22 @@ pub struct ClientSettings {
     pub recent_operations: Vec<LogEntry>,
 
     // Backup settings
-    pub backup_file_path: String,  // Add this field
-    
+    pub backup_paths: Vec<BackupPathEntry>,
+
     // Additional settings
     pub auto_update: bool,
     pub default_download_path: String,
     pub upload_chunk_size: usize,
     pub download_chunk_size: usize,
     pub max_concurrent_transfers: u8,
+}
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BackupPathEntry {
+    pub path: String,
+    pub is_directory: bool,
+    pub include_subdirectories: bool,
+    pub file_pattern: Option<String>, // For filtering files in directories
+    pub last_backup_time: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -91,7 +99,7 @@ impl Default for ClientSettings {
             recent_operations: Vec::new(),
 
             // Backup settings
-            backup_file_path: "./backups/".to_string(),
+            backup_paths: Vec::new(),
 
             // Additional settings
             auto_update: true,
@@ -230,6 +238,33 @@ impl ClientSettings {
         rng.fill(&mut key);
         key
     }
+    /// Add a new backup path to the settings
+    pub fn add_backup_path(&mut self, path: String, is_directory: bool) -> Result<()> {
+        // Validate the path exists
+        let path_obj = Path::new(&path);
+        if !path_obj.exists() {
+            return Err(anyhow::anyhow!("Path does not exist: {}", path));
+        }
+
+        // Add to the list
+        self.backup_paths.push(BackupPathEntry {
+            path,
+            is_directory,
+            include_subdirectories: true, // Default to including subdirectories
+            file_pattern: None,
+            last_backup_time: None,
+        });
+
+        Ok(())
+    }
+
+    /// Update the last backup time for a path
+    pub fn update_backup_time(&mut self, path: &str, timestamp: u64) {
+        if let Some(entry) = self.backup_paths.iter_mut().find(|e| e.path == path) {
+            entry.last_backup_time = Some(timestamp);
+        }
+    }
+
 }
 
 #[cfg(test)]

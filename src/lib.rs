@@ -96,7 +96,7 @@ pub fn calculate_hash(data: &[u8]) -> String {
 }
 
 // Common messages used by both client and server
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum BackupMessage {
     InitBackup(BackupRequest),
     ChunkData {
@@ -107,6 +107,9 @@ pub enum BackupMessage {
     Complete {
         hash: String,
         chunks_count: u64,
+    },
+    Disconnect {
+        reason: String,
     },
 }
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -130,9 +133,10 @@ pub enum ServerResponse {
         hash: String,
         chunks_count: u64,
     },
+    DisconnectAck,
     Error(String),
 }
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BackupRequest {
     pub file_info: FileInfo,
     pub chunk_size: u64,
@@ -146,7 +150,7 @@ pub struct ChunkInfo {
 }
 
 // Make FileInfo and other common structs public
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileInfo {
     pub path: PathBuf,
     pub hash: String,

@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use iced::theme::Theme::{SolarizedDark, SolarizedLight};
-use iced::widget::{button, column, container, row, text, text_input};
+use iced::widget::{button, column, container, horizontal_rule, row, text, text_input, Space};
 use iced::window::Position;
 use iced::{Application, Command, Element, Length, Settings, Size, Theme};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio_rustls::{rustls, TlsConnector};
-
+use tokio_rustls::client::TlsStream;
 use tracing::{debug, error, info, warn};
 
 use llamapak::{
@@ -17,6 +17,7 @@ use llamapak::{
     receive_message, send_message, BackupMessage, BackupRequest, ChunkedFileOperation,
     ConnectionConfig, FileInfo, ServerResponse, DEFAULT_CHUNK_SIZE,
 };
+use llamapak::client_settings::BackupPathEntry;
 use llamapak::tls_client::TlsClient;
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,12 @@ enum Message {
     SettingsLoaded(Result<ClientSettings, String>),
     SettingsSaved(Result<(), String>),
     SyncSettings,
+    AddBackupPath,
+    RemoveBackupPath(usize),  // Index of the path to remove
+    SelectBackupPathType(bool), // true for directory, false for file
+    SetBackupPathIncludeSubdirs(bool),
+    SetBackupPathPattern(String),
+    SetNewBackupPath(String), // For storing the path being edited before adding
 }
 
 // TODO: Pseudo-code for future client implementation
@@ -75,6 +82,11 @@ struct BackupClient {
     show_settings: bool,
     new_server_ip: String,
     new_server_port: String,
+    new_backup_path: String,
+    is_directory_backup: bool,
+    include_subdirectories: bool,
+    file_pattern: String,
+
 }
 
 impl BackupClient {
@@ -131,11 +143,82 @@ impl BackupClient {
             show_settings: false,
             new_server_ip: server_address,
             new_server_port: server_port.to_string(),
+            new_backup_path: String::new(),
+            is_directory_backup: true, // Default to directory backup
+            include_subdirectories: true,
+            file_pattern: String::new(),
+
         }
     }
     
     pub fn should_exit(&self) -> bool {
         self.should_exit
+    }
+
+    fn view_backup_paths(&self) -> Element<Message> {
+        let paths: Vec<Element<_>> = self.settings.backup_paths
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                row![
+                    // Path type icon (folder or file)
+                    text(if entry.is_directory { "📁" } else { "📄" }).size(16),
+                    
+                    // Path details
+                    column![
+                        text(&entry.path).size(16),
+                        if entry.is_directory {
+                            text(format!(
+                                "Include subdirs: {}{}",
+                                if entry.include_subdirectories { "Yes" } else { "No" },
+                                entry.file_pattern.as_ref().map_or("".to_string(), |p| format!(", Pattern: {}", p))
+                            )).size(14)
+                        } else {
+                            text("").size(14)
+                        },
+                        if let Some(time) = entry.last_backup_time {
+                            text(format!(
+                                "Last backup: {}",
+                                chrono::DateTime::from_timestamp(time as i64, 0)
+                                    .map_or("Invalid time".to_string(), |dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            )).size(14)
+                        } else {
+                            text("Never backed up").size(14)
+                        },
+                    ].width(Length::Fill),
+                    
+                    // Remove button
+                    button(text("❌"))
+                        .on_press(Message::RemoveBackupPath(index))
+                        .style(iced::theme::Button::Destructive),
+                ]
+                    .spacing(10)
+                    .padding(5)
+                    .width(Length::Fill)
+                    .into()
+            })
+            .collect();
+
+        if paths.is_empty() {
+            // Show message when no paths are configured
+            container(
+                text("No backup paths configured. Add one below.")
+                    .size(16)
+            )
+                .width(Length::Fill)
+                .center_x()
+                .padding(10)
+                .into()
+        } else {
+            // Show scrollable list of paths
+            iced::widget::scrollable(
+                column(paths)
+                    .spacing(5)
+                    .width(Length::Fill)
+            )
+                .height(Length::from(200))
+                .into()
+        }
     }
 
     pub async fn initialize(&mut self) -> Result<()> {
@@ -260,8 +343,54 @@ impl BackupClient {
         Ok(tls_stream)
     }
     
-    pub async fn start_backup(&self, file_path: &Path) -> Result<()> {
+    pub async fn start_backup(&self, path: &Path) -> Result<()> {
+        // Check if the path exists
+        if !path.exists() {
+            return Err(anyhow::anyhow!("Path does not exist: {}", path.display()));
+        }
+        // Handle directory
+        if path.is_dir() {
+            info!("Backing up directory: {}", path.display());
+            return self.start_directory_backup(path).await;
+        }
+
+        // Otherwise proceed with single file backup
+        info!("Starting backup for file: {}", path.display());
+
         let mut stream = self.connect().await?;
+
+        // Call the helper method for backup with existing connection
+        let result = self.backup_file_with_existing_connection(&mut stream, path).await;
+
+        // Send disconnect message using helper function
+        let disconnect_msg = BackupMessage::Disconnect {
+            reason: "Backup session complete".to_string()
+        };
+
+        if let Err(e) = send_message(&mut stream, &disconnect_msg).await {
+            warn!("Failed to send disconnect message: {}", e);
+        } else {
+            // Receive disconnect acknowledgment using helper function
+            match receive_message::<ServerResponse, _>(&mut stream).await {
+                Ok(ServerResponse::DisconnectAck) => {
+                    debug!("Server acknowledged disconnect request");
+                },
+                Ok(_) => {
+                    warn!("Unexpected response to disconnect request");
+                },
+                Err(e) => {
+                    warn!("Error receiving disconnect acknowledgment: {}", e);
+                }
+            }
+        }
+
+        // Return the result from the backup operation
+        result
+    }
+
+    /// Backup a file using an existing connection
+    async fn backup_file_with_existing_connection(&self, stream: &mut TlsStream<TcpStream>, file_path: &Path) -> Result<()> {
+        info!("Starting backup for file using existing connection: {}", file_path.display());
 
         // Read the file and get metadata
         let file_content = tokio::fs::read(file_path).await?;
@@ -285,18 +414,19 @@ impl BackupClient {
 
         // Send init backup message
         let init_message = BackupMessage::InitBackup(request);
-        send_message(&mut stream, &init_message).await?;
+        send_message(stream, &init_message).await?;
 
         // Wait for server ready response with negotiated chunk size
-        let response = receive_message::<ServerResponse, _>(&mut stream).await?;
+        let response = receive_message::<ServerResponse, _>(stream).await?;
         let actual_chunk_size = match response {
             ServerResponse::Ready {
                 negotiated_chunk_size,
             } => {
                 info!(
-                    "Server ready to receive backup with chunk size: {} bytes",
-                    negotiated_chunk_size
-                );
+                "Server ready to receive file '{}' with chunk size: {} bytes",
+                file_path.display(),
+                negotiated_chunk_size
+            );
                 negotiated_chunk_size
             }
             ServerResponse::Error(msg) => {
@@ -322,10 +452,10 @@ impl BackupClient {
                 chunk_hash: chunk_hash.clone(),
             };
 
-            send_message(&mut stream, &chunk_message).await?;
+            send_message(stream, &chunk_message).await?;
 
             // Wait for chunk receipt confirmation
-            let response = receive_message::<ServerResponse, _>(&mut stream).await?;
+            let response = receive_message::<ServerResponse, _>(stream).await?;
             match response {
                 ServerResponse::ChunkReceived {
                     offset: resp_offset,
@@ -333,20 +463,23 @@ impl BackupClient {
                 } => {
                     if resp_offset != offset {
                         return Err(anyhow::anyhow!(
-                            "Server acknowledged wrong chunk offset: {} (expected {})",
-                            resp_offset,
-                            offset
-                        ));
+                        "Server acknowledged wrong chunk offset: {} (expected {})",
+                        resp_offset,
+                        offset
+                    ));
                     }
 
                     if !verified {
                         return Err(anyhow::anyhow!(
-                            "Chunk verification failed at offset {}",
-                            offset
-                        ));
+                        "Chunk verification failed at offset {}",
+                        offset
+                    ));
                     }
 
-                    info!("Chunk at offset {} verified successfully", offset);
+                    // Log only occasionally for large files
+                    if chunks_count % 20 == 0 || chunks_count == 0 {
+                        info!("Chunk {} at offset {} verified successfully", chunks_count, offset);
+                    }
                 }
                 ServerResponse::Error(msg) => {
                     return Err(anyhow::anyhow!("Server error: {}", msg));
@@ -360,27 +493,273 @@ impl BackupClient {
         }
 
         // Send completion message
+        info!("All chunks sent for file '{}', sending completion message", file_path.display());
         let complete_message = BackupMessage::Complete {
             hash: file_hash,
             chunks_count,
         };
 
-        send_message(&mut stream, &complete_message).await?;
+        send_message(stream, &complete_message).await?;
 
         // Wait for completion confirmation
-        let response = receive_message::<ServerResponse, _>(&mut stream).await?;
+        let response = receive_message::<ServerResponse, _>(stream).await?;
         match response {
             ServerResponse::BackupComplete { verified } => {
                 if verified {
-                    // Log this successful backup in the client settings
-                    info!("Backup completed and verified successfully");
+                    info!("File '{}' backup completed and verified successfully", file_path.display());
                     Ok(())
                 } else {
-                    Err(anyhow::anyhow!("Backup completed but verification failed"))
+                    Err(anyhow::anyhow!("File '{}' backup completed but verification failed", file_path.display()))
                 }
             }
-            ServerResponse::Error(msg) => Err(anyhow::anyhow!("Server error: {}", msg)),
-            _ => Err(anyhow::anyhow!("Unexpected server response")),
+            ServerResponse::Error(msg) => Err(anyhow::anyhow!("Server error for file '{}': {}", file_path.display(), msg)),
+            _ => Err(anyhow::anyhow!("Unexpected server response for file '{}'", file_path.display())),
+        }
+    }
+
+    /// Start backup of multiple files/directories from settings
+    pub async fn start_backup_from_settings(&self) -> Result<()> {
+        if self.settings.backup_paths.is_empty() {
+            return Err(anyhow::anyhow!("No backup paths configured"));
+        }
+
+        info!("Starting backup of {} configured paths", self.settings.backup_paths.len());
+
+        // Connect once for all files
+        let mut stream = self.connect().await?;
+
+        // Process each path in settings
+        let mut success_count = 0;
+        let total_paths = self.settings.backup_paths.len();
+
+        for (index, path_entry) in self.settings.backup_paths.iter().enumerate() {
+            let path = Path::new(&path_entry.path);
+
+            // Skip if path doesn't exist
+            if !path.exists() {
+                warn!("Skipping non-existent path {}/{}: {}", index + 1, total_paths, path.display());
+                continue;
+            }
+
+            info!("Processing backup path {}/{}: {}", index + 1, total_paths, path.display());
+
+            if path.is_dir() && path_entry.is_directory {
+                // Process directory
+                info!("Backing up directory: {}", path.display());
+
+                // Collect files from directory
+                let files = self.collect_files_from_directory(
+                    path,
+                    path_entry.include_subdirectories,
+                    path_entry.file_pattern.as_deref(),
+                )?;
+
+                if files.is_empty() {
+                    info!("No files found in directory: {}", path.display());
+                    continue;
+                }
+
+                info!("Found {} files in directory {}", files.len(), path.display());
+
+                // Process each file in the directory
+                let mut dir_success_count = 0;
+                for file_path in &files {
+                    match self.backup_file_with_existing_connection(&mut stream, file_path).await {
+                        Ok(()) => {
+                            info!("Successfully backed up file: {}", file_path.display());
+                            dir_success_count += 1;
+                        },
+                        Err(e) => {
+                            warn!("Failed to back up file {}: {}", file_path.display(), e);
+                        }
+                    }
+                }
+
+                if dir_success_count == files.len() {
+                    info!("Directory {} backup completed successfully", path.display());
+                    success_count += 1;
+                } else {
+                    warn!("Directory {} backup completed with errors: {}/{} files succeeded",
+                     path.display(), dir_success_count, files.len());
+                }
+            } else if path.is_file() {
+                // Process single file
+                match self.backup_file_with_existing_connection(&mut stream, path).await {
+                    Ok(()) => {
+                        info!("Successfully backed up file: {}", path.display());
+                        success_count += 1;
+                    },
+                    Err(e) => {
+                        warn!("Failed to back up file {}: {}", path.display(), e);
+                    }
+                }
+            }
+        }
+
+        // Send disconnect message
+        info!("All backup paths processed. Successfully backed up {}/{} paths", success_count, total_paths);
+        let disconnect_msg = BackupMessage::Disconnect {
+            reason: "Backup from settings complete".to_string(),
+        };
+
+        if let Err(e) = send_message(&mut stream, &disconnect_msg).await {
+            warn!("Failed to send disconnect message: {}", e);
+        } else {
+            // Wait for disconnect acknowledgment
+            match receive_message::<ServerResponse, _>(&mut stream).await {
+                Ok(ServerResponse::DisconnectAck) => {
+                    info!("Server acknowledged disconnect request");
+                },
+                Ok(other) => {
+                    warn!("Unexpected response to disconnect request: {:?}", other);
+                },
+                Err(e) => {
+                    warn!("Error receiving disconnect acknowledgment: {}", e);
+                }
+            }
+        }
+
+        if success_count == total_paths {
+            info!("All backup paths processed successfully");
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Backup completed with errors: {}/{} paths succeeded", success_count, total_paths))
+        }
+    }
+
+    /// Collect files from a directory with optional pattern matching
+    fn collect_files_from_directory(
+        &self,
+        dir_path: &Path,
+        include_subdirectories: bool,
+        file_pattern: Option<&str>,
+    ) -> Result<Vec<PathBuf>> {
+        use walkdir::WalkDir;
+        use regex::Regex;
+
+        let mut files = Vec::new();
+
+        // Create WalkDir with appropriate depth
+        let walkdir = if include_subdirectories {
+            WalkDir::new(dir_path)
+        } else {
+            WalkDir::new(dir_path).max_depth(1)
+        };
+
+        // Compile regex if pattern is provided
+        let pattern = if let Some(pattern_str) = file_pattern {
+            match Regex::new(pattern_str) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    warn!("Invalid file pattern '{}': {}", pattern_str, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Walk directory and collect files
+        for entry in walkdir.into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+
+            // Skip directories
+            if path.is_dir() {
+                continue;
+            }
+
+            // Apply pattern filter if one exists
+            if let Some(ref regex) = pattern {
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if !regex.is_match(file_name) {
+                        continue;
+                    }
+                }
+            }
+
+            debug!("Adding file to backup list: {}", path.display());
+            files.push(path.to_path_buf());
+        }
+
+        Ok(files)
+    }
+    /// Backup a directory by sending all files within it
+    async fn start_directory_backup(&self, dir_path: &Path) -> Result<()> {
+        use walkdir::WalkDir;
+
+        info!("Starting backup for directory: {}", dir_path.display());
+
+        // Collect all files from the directory
+        let mut files = Vec::new();
+        for entry in WalkDir::new(dir_path).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+
+            // Skip directories
+            if path.is_dir() {
+                continue;
+            }
+
+            info!("Adding file to backup list: {}", path.display());
+            files.push(path.to_path_buf());
+        }
+
+        if files.is_empty() {
+            info!("No files found in directory: {}", dir_path.display());
+            return Ok(());
+        }
+
+        info!("Starting multi-file backup with {} files from directory", files.len());
+
+        // Open a single connection for all files
+        let mut stream = self.connect().await?;
+
+        // Process each file in sequence
+        let mut success_count = 0;
+        let total_files = files.len();
+
+        for (index, file_path) in files.iter().enumerate() {
+            info!("Processing file {}/{}: {}", index + 1, total_files, file_path.display());
+
+            // Try to back up this specific file
+            match self.backup_file_with_existing_connection(&mut stream, file_path).await {
+                Ok(()) => {
+                    info!("Successfully backed up file: {}", file_path.display());
+                    success_count += 1;
+                },
+                Err(e) => {
+                    warn!("Failed to back up file {}: {}", file_path.display(), e);
+                }
+            }
+        }
+
+        // Send disconnect message
+        info!("Directory backup completed. Successfully backed up {}/{} files", success_count, total_files);
+        let disconnect_msg = BackupMessage::Disconnect {
+            reason: "Directory backup session complete".to_string(),
+        };
+
+        if let Err(e) = send_message(&mut stream, &disconnect_msg).await {
+            warn!("Failed to send disconnect message: {}", e);
+        } else {
+            // Wait for disconnect acknowledgment
+            match receive_message::<ServerResponse, _>(&mut stream).await {
+                Ok(ServerResponse::DisconnectAck) => {
+                    info!("Server acknowledged disconnect request");
+                },
+                Ok(other) => {
+                    warn!("Unexpected response to disconnect request: {:?}", other);
+                },
+                Err(e) => {
+                    warn!("Error receiving disconnect acknowledgment: {}", e);
+                }
+            }
+        }
+
+        if success_count == total_files {
+            info!("Directory backup completed successfully");
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Directory backup completed with errors: {}/{} files succeeded", success_count, total_files))
         }
     }
 }
@@ -418,36 +797,67 @@ impl Application for BackupClient {
         match message {
             Message::SetBackupPath(path) => {
                 self.backup_path = path.clone();
-                self.settings.backup_file_path = path;
+                // Update or add to backup_paths in settings
+                if let Some(entry) = self.settings.backup_paths.iter_mut().find(|e| e.path == path) {
+                    // Path already exists in list
+                } else {
+                    // Add as new backup path
+                    self.settings.backup_paths.push(BackupPathEntry {
+                        path,
+                        is_directory: false,
+                        include_subdirectories: true,  // Default to including subdirectories
+                        file_pattern: None,            // No file pattern by default
+                        last_backup_time: None,
+                    });
+                }
+
                 iced::Command::none()
             }
             Message::StartBackup => {
-                if self.settings.backup_file_path.is_empty() {
-                    self.status = "Error: No backup file path specified".to_string();
+                // Check if there are any active backup paths
+                if self.settings.backup_paths.is_empty() {
+                    self.status = "Error: No backup paths specified".to_string();
                     return iced::Command::none();
                 }
 
                 self.status = "Initializing backup...".to_string();
                 self.is_running = true;  // Add this line
-                
+
                 // Log this in settings
                 self.settings.add_log_entry(
                     "Backup".to_string(),
                     OperationStatus::InProgress,
-                    format!("Starting backup of {}", self.backup_path)
+                    format!("Starting backup with {} active paths",
+                            self.settings.backup_paths.iter().count())
                 );
-                
-                let path = PathBuf::from(self.backup_path.clone());
+
+                let backup_paths = self.settings.backup_paths.clone();
                 let server_address = self.server_address.clone();
                 let settings = self.settings.clone();
                 let encryption_key = self.encryption_key;
-                
+
                 Command::perform(
-                    start_backup_async(path, server_address, settings, encryption_key),
+                    async move {
+                        let mut errors = Vec::new();
+
+                        for path_entry in backup_paths {
+                            let path = PathBuf::from(path_entry.path);
+                            match start_backup_async(path.clone(), server_address.clone(), settings.clone(), encryption_key).await {
+                                Ok(_) => {},
+                                Err(e) => errors.push(format!("Error backing up {}: {}", path.display(), e)),
+                            }
+                        }
+
+                        if errors.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(anyhow::anyhow!("Backup errors: {}", errors.join("; ")))
+                        }
+                    },
                     |result| match result {
                         Ok(()) => Message::BackupInitiated(Ok(())),
                         Err(e) => Message::BackupInitiated(Err(e.to_string())),
-                    },
+                    }
                 )
             }
             Message::StopBackup => {
@@ -694,12 +1104,74 @@ impl Application for BackupClient {
                 // 3. Update self.settings.backup_file_path
 
                 // For now, just set a test file path
-                self.settings.backup_file_path = String::from("./backups/key.pem");
-                self.backup_path = self.settings.backup_file_path.clone();
+                let test_path = String::from("./backups/");
+
+                // Add to backup paths if not already present
+                if !self.settings.backup_paths.iter().any(|e| e.path == test_path) {
+                    self.settings.backup_paths.push(BackupPathEntry {
+                        path: test_path.clone(),
+                        is_directory: true,
+                        include_subdirectories: false, // For a file, this doesn't apply
+                        file_pattern: None,
+                        last_backup_time: None,
+                    });
+                }
 
                 iced::Command::none()
             }
+            // New message handlers for backup paths
+            Message::SetNewBackupPath(path) => {
+                self.new_backup_path = path;
+                Command::none()
+            }
+            Message::SelectBackupPathType(is_directory) => {
+                self.is_directory_backup = is_directory;
+                Command::none()
+            }
+            Message::SetBackupPathIncludeSubdirs(include) => {
+                self.include_subdirectories = include;
+                Command::none()
+            }
+            Message::SetBackupPathPattern(pattern) => {
+                self.file_pattern = pattern;
+                Command::none()
+            }
+            Message::AddBackupPath => {
+                // Validate path exists
+                let path = Path::new(&self.new_backup_path);
+                if !path.exists() {
+                    self.status = format!("Path does not exist: {}", self.new_backup_path);
+                    return Command::none();
+                }
 
+                // Add to settings
+                self.settings.backup_paths.push(BackupPathEntry {
+                    path: self.new_backup_path.clone(),
+                    is_directory: self.is_directory_backup,
+                    include_subdirectories: self.include_subdirectories,
+                    file_pattern: if self.file_pattern.is_empty() {
+                        None
+                    } else {
+                        Some(self.file_pattern.clone())
+                    },
+                    last_backup_time: None,
+                });
+
+                // Reset form
+                self.new_backup_path = String::new();
+                self.file_pattern = String::new();
+                self.status = "Backup path added.".to_string();
+
+                Command::none()
+            }
+            Message::RemoveBackupPath(index) => {
+                if index < self.settings.backup_paths.len() {
+                    let path = self.settings.backup_paths[index].path.clone();
+                    self.settings.backup_paths.remove(index);
+                    self.status = format!("Removed backup path: {}", path);
+                }
+                Command::none()
+            }
         }
     }
     
@@ -709,17 +1181,65 @@ impl Application for BackupClient {
             let settings_form = column![
                 text("Client Settings").size(24),
                 
-                // Backup file settings
-                text("Backup File Path:").size(16),
+                // Backup Paths section
+                text("Backup Paths:").size(18),
+                
+                // List of current backup paths
+                self.view_backup_paths(),
+                
+                // Add new backup path form
+                text("Add New Backup Path").size(16),
                 row![
-                    text_input("Enter file path...", &self.settings.backup_file_path)
-                        .on_input(Message::SetBackupPath)
+                    text_input("Enter file path...", &self.new_backup_path)
+                        .on_input(Message::SetNewBackupPath)
                         .width(Length::FillPortion(5)),
                     button(text("Browse..."))
                         .on_press(Message::BrowseForBackupFile)
                         .width(Length::FillPortion(1)),
                 ].spacing(10),
-                    
+                
+                // Backup type controls
+                row![
+                    text("Type:").size(16),
+                    button(
+                        text(if self.is_directory_backup { "Directory" } else { "File" })
+                    ).on_press(Message::SelectBackupPathType(!self.is_directory_backup)),
+                ].spacing(10),
+                
+                // Subdirectory controls (only visible for directory backups)
+                if self.is_directory_backup {
+                    row![
+                        text("Include Subdirectories:").size(16),
+                        button(
+                            text(if self.include_subdirectories { "Yes" } else { "No" })
+                        ).on_press(Message::SetBackupPathIncludeSubdirs(!self.include_subdirectories)),
+                    ].spacing(10)
+                } else {
+                    row![].spacing(0) // Empty row instead of container
+                },
+                
+                // File pattern control (only visible for directory backups)
+                if self.is_directory_backup {
+                    row![
+                        text("File Pattern:").size(16),
+                        text_input("e.g., *.txt,*.md", &self.file_pattern)
+                            .on_input(Message::SetBackupPathPattern)
+                            .width(Length::Fill),
+                    ].spacing(10)
+                } else {
+                    row![].spacing(0) // Empty row instead of container
+                },
+
+    
+                // Add button
+                button(text("Add Backup Path"))
+                    .on_press(Message::AddBackupPath)
+                    .width(Length::Fill),
+                
+                // Separator
+                horizontal_rule(1),
+
+                        
                 // Server settings
                 text("Server IP:").size(16),
                 text_input("127.0.0.1", &self.new_server_ip)
@@ -798,11 +1318,14 @@ impl Application for BackupClient {
                                 OperationStatus::InProgress => "In Progress",
                             };
                             
+                            // Use unwrap_or_else for better error handling
+                            let formatted_time = chrono::DateTime::from_timestamp(entry.timestamp as i64, 0)
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                                .unwrap_or_else(|| "Unknown time".to_string());
+                            
                             text(format!(
                                 "{}: {} - {} - {}",
-                                chrono::DateTime::from_timestamp(entry.timestamp as i64, 0)
-                                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                                    .unwrap_or_else(|| "Unknown time".to_string()),
+                                formatted_time,
                                 entry.operation,
                                 status_text,
                                 entry.details

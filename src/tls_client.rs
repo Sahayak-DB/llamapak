@@ -7,7 +7,7 @@ use rustls::ServerName;
 use rustls::{Certificate, ClientConfig, RootCertStore};
 use rustls_pemfile;
 use sha2::Digest;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -298,7 +298,277 @@ impl TlsClient {
             )),
         }
     }
-    
+    /// Send multiple files to the server in a single session
+    pub async fn send_multiple_files(
+        &self,
+        file_paths: &Vec<PathBuf>,
+        preferred_chunk_size: Option<u64>,
+    ) -> Result<Vec<(PathBuf, bool)>> {
+        // Connect once for all files
+        let mut stream = self.connect().await?;
+        let mut results = Vec::new();
+
+        info!("Starting multi-file backup session with {} files", file_paths.len());
+
+        // Process each file
+        for file_path in file_paths {
+            match self.send_file_over_existing_connection(&mut stream, file_path, preferred_chunk_size).await {
+                Ok(verified) => {
+                    info!("File '{}' transfer completed, verified: {}", file_path.display(), verified);
+                    results.push((file_path.clone(), verified));
+                },
+                Err(e) => {
+                    warn!("Failed to transfer file '{}': {}", file_path.display(), e);
+                    results.push((file_path.clone(), false));
+                }
+            }
+        }
+
+        // Send disconnect message
+        info!("All files processed, sending disconnect message");
+        let disconnect_msg = BackupMessage::Disconnect {
+            reason: "Backup session complete".to_string(),
+        };
+
+        if let Err(e) = send_message(&mut stream, &disconnect_msg).await {
+            warn!("Failed to send disconnect message: {}", e);
+        } else {
+            // Wait for disconnect acknowledgment from server
+            match receive_message::<ServerResponse, _>(&mut stream).await {
+                Ok(ServerResponse::DisconnectAck) => {
+                    info!("Server acknowledged disconnect request");
+                },
+                Ok(other) => {
+                    warn!("Unexpected response to disconnect request: {:?}", other);
+                },
+                Err(e) => {
+                    warn!("Error receiving disconnect acknowledgment: {}", e);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Send a file over an existing connection
+    async fn send_file_over_existing_connection(
+        &self,
+        stream: &mut TlsStream<TcpStream>,
+        file_path: &Path,
+        preferred_chunk_size: Option<u64>,
+    ) -> Result<bool> {
+        // Get file metadata
+        let file_metadata = tokio::fs::metadata(file_path).await?;
+        let file_size = file_metadata.len();
+
+        info!("Sending file '{}' ({} bytes) to server", file_path.display(), file_size);
+
+        // Request chunk size (use default if not specified)
+        let requested_chunk_size = preferred_chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
+
+        // Create backup request
+        let request = BackupRequest {
+            file_info: FileInfo {
+                path: file_path.to_path_buf(),
+                hash: String::new(), // We'll calculate during chunking
+                size: file_size,
+            },
+            chunk_size: requested_chunk_size,
+        };
+
+        // Send initialization request
+        let init_message = BackupMessage::InitBackup(request);
+        send_message(stream, &init_message).await?;
+
+        // Get negotiated chunk size from server
+        let response = receive_message::<ServerResponse, _>(stream).await?;
+        let actual_chunk_size = match response {
+            ServerResponse::Ready { negotiated_chunk_size } => {
+                info!(
+                    "Server ready to receive file '{}' with chunk size: {} bytes",
+                    file_path.display(),
+                    negotiated_chunk_size
+                );
+                negotiated_chunk_size
+            }
+            ServerResponse::Error(msg) => {
+                return Err(anyhow::anyhow!("Server error: {}", msg));
+            }
+            _ => {
+                return Err(anyhow::anyhow!("Unexpected server response"));
+            }
+        };
+
+        // Process file in chunks
+        let mut file = tokio::fs::File::open(file_path).await?;
+        let mut buffer = vec![0u8; actual_chunk_size as usize];
+        let mut offset = 0u64;
+        let mut hasher = sha2::Sha256::new();
+        let mut chunks_count = 0u64;
+
+        // Read and process each chunk
+        loop {
+            let bytes_read = file.read(&mut buffer).await?;
+            if bytes_read == 0 {
+                break; // End of file
+            }
+
+            // Update the file hash
+            hasher.update(&buffer[..bytes_read]);
+
+            // Calculate chunk hash
+            let chunk_hash = calculate_hash(&buffer[..bytes_read]);
+
+            // Send chunk
+            let chunk_message = BackupMessage::ChunkData {
+                offset,
+                data: buffer[..bytes_read].to_vec(),
+                chunk_hash: chunk_hash.clone(),
+            };
+            send_message(stream, &chunk_message).await?;
+
+            // Wait for chunk receipt confirmation
+            let response = receive_message::<ServerResponse, _>(stream).await?;
+            match response {
+                ServerResponse::ChunkReceived { offset: resp_offset, verified } => {
+                    if resp_offset != offset {
+                        return Err(anyhow::anyhow!(
+                            "Server acknowledged wrong chunk offset: {} (expected {})",
+                            resp_offset,
+                            offset
+                        ));
+                    }
+                    if !verified {
+                        return Err(anyhow::anyhow!("Chunk verification failed at offset {}", offset));
+                    }
+                    // Log only occasionally to avoid excessive logging
+                    if chunks_count % 100 == 0 || chunks_count == 0 {
+                        info!(
+                            "Chunk {} at offset {} verified successfully ({} bytes)",
+                            chunks_count, offset, bytes_read
+                        );
+                    }
+                }
+                ServerResponse::Error(msg) => {
+                    return Err(anyhow::anyhow!("Server error: {}", msg));
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Unexpected server response"));
+                }
+            }
+
+            offset += bytes_read as u64;
+            chunks_count += 1;
+        }
+
+        // Get the final file hash
+        let file_hash = format!("{:x}", hasher.finalize());
+
+        // Send completion message
+        info!("File '{}' transfer complete, sending completion message", file_path.display());
+        let complete_message = BackupMessage::Complete {
+            hash: file_hash.clone(),
+            chunks_count,
+        };
+        send_message(stream, &complete_message).await?;
+
+        // Wait for completion confirmation
+        let response = receive_message::<ServerResponse, _>(stream).await?;
+        match response {
+            ServerResponse::BackupComplete { verified } => {
+                if verified {
+                    info!("File '{}' sent and verified successfully", file_path.display());
+                    Ok(true)
+                } else {
+                    warn!("File '{}' sent but verification failed", file_path.display());
+                    Ok(false)
+                }
+            }
+            ServerResponse::Error(msg) => {
+                Err(anyhow::anyhow!("Server error during completion: {}", msg))
+            }
+            _ => Err(anyhow::anyhow!("Unexpected server response during completion")),
+        }
+    }
+
+    /// Send a directory to the server
+    pub async fn send_directory(
+        &self,
+        dir_path: &Path,
+        include_subdirectories: bool,
+        file_pattern: Option<&str>,
+        preferred_chunk_size: Option<u64>,
+    ) -> Result<Vec<(PathBuf, bool)>> {
+        info!("Preparing to backup directory: {}", dir_path.display());
+
+        // Collect all files from the directory
+        let files = self.collect_files_from_directory(dir_path, include_subdirectories, file_pattern)?;
+
+        if files.is_empty() {
+            info!("No files found in directory {} matching pattern", dir_path.display());
+            return Ok(Vec::new());
+        }
+
+        info!("Found {} files to backup in directory {}", files.len(), dir_path.display());
+
+        // Send all files in one session
+        self.send_multiple_files(&files, preferred_chunk_size).await
+    }
+
+    /// Collect files from a directory, optionally including subdirectories and filtering by pattern
+    fn collect_files_from_directory(
+        &self,
+        dir_path: &Path,
+        include_subdirectories: bool,
+        file_pattern: Option<&str>,
+    ) -> Result<Vec<PathBuf>> {
+        use walkdir::WalkDir;
+
+        let mut files = Vec::new();
+        let walkdir = if include_subdirectories {
+            WalkDir::new(dir_path)
+        } else {
+            WalkDir::new(dir_path).max_depth(1)
+        };
+
+        // Compile regex if pattern is provided
+        let pattern = if let Some(pattern_str) = file_pattern {
+            use regex::Regex;
+            match Regex::new(pattern_str) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    warn!("Invalid file pattern '{}': {}", pattern_str, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        for entry in walkdir.into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+
+            // Skip directories
+            if path.is_dir() {
+                continue;
+            }
+
+            // Apply pattern filter if one exists
+            if let Some(ref regex) = pattern {
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if !regex.is_match(file_name) {
+                        continue;
+                    }
+                }
+            }
+
+            files.push(path.to_path_buf());
+        }
+
+        Ok(files)
+    }
+
+
     /// Get the TLS connector
     pub fn get_connector(&self) -> TlsConnector {
         self.connector.clone()
