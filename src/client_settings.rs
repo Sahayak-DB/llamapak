@@ -79,8 +79,8 @@ impl Default for ClientSettings {
     fn default() -> Self {
         ClientSettings {
             // Default GUI settings
-            window_width: 1024,
-            window_height: 768,
+            window_width: 1200,
+            window_height: 1200,
             dark_mode: true,
             font_size: 12,
             auto_connect: true,

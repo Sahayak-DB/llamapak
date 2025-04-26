@@ -209,7 +209,7 @@ impl BackupServer {
 
                     let acceptor = self.acceptor.clone();
                     let storage_path = self.storage_path.clone();
-                    
+
                     tokio::spawn(async move {
                         match acceptor.accept(stream).await {
                             Ok(stream) => {
@@ -260,14 +260,6 @@ impl BackupServer {
                     let requested_chunk_size = request.chunk_size;
                     let negotiated_chunk_size = negotiate_chunk_size(requested_chunk_size);
 
-                    // Create session with negotiated chunk size, not requested chunk size
-                    let mut session = Some(BackupSession::new(
-                        file_path.clone(),
-                        request.file_info.hash.clone(),
-                        request.file_info.size,
-                        negotiated_chunk_size, // Use negotiated size here
-                    ));
-
                     info!(
                     "Received backup request: file '{}', size: {} bytes, hash: {}, chunk size: {} bytes",
                     format!("{}", file_path.display()),
@@ -282,14 +274,6 @@ impl BackupServer {
                     };
                     send_message(&mut stream, &response).await?;
 
-                    // Create a path for the file within the storage directory
-                    let mut relative_path = request.file_info.path.clone();
-                    if relative_path.is_absolute() {
-                        // Extract the last component if the path is absolute
-                        if let Some(file_name) = relative_path.file_name() {
-                            relative_path = PathBuf::from(file_name);
-                        }
-                    }
                     // Create a new backup session
                     let mut session = BackupSession::new(
                         file_path,
@@ -297,13 +281,11 @@ impl BackupServer {
                         request.file_info.size,
                         negotiated_chunk_size,
                     );
+                    
                     // Process file chunks
-                    let mut expected_chunks = 0u64;
-                    let mut is_complete = false;
-
-                    while !is_complete {
+                    loop {
                         let message = receive_message::<BackupMessage, _>(&mut stream).await?;
-                        
+
                         match message {
                             BackupMessage::ChunkData {
                                 offset,
@@ -321,7 +303,7 @@ impl BackupServer {
                                     );
                                 }
                                 let verified = session.verify_chunk(offset, data, chunk_hash);
-                                
+
                                 send_message(
                                     &mut stream,
                                     &ServerResponse::ChunkReceived { offset, verified },
@@ -329,8 +311,8 @@ impl BackupServer {
                                     .await?;
                             }
                             BackupMessage::Complete {
-                                hash, 
-                                chunks_count 
+                                hash,
+                                chunks_count
                             } => {
                                     // Verify the client-provided hash matches what we expect
                                     if hash != session.file_operation.expected_hash {
@@ -362,7 +344,7 @@ impl BackupServer {
                                             )),
                                         )
                                             .await?;
-                                        continue;
+                                        break;
                                     }
                                     match session.save_file().await {
                                         Ok(verified) => {
@@ -392,10 +374,10 @@ impl BackupServer {
                                                 .await?;
                                         }
                                     }
+                                break;
                             }
                             BackupMessage::Disconnect { reason } => {
-                                // Client is requesting to end the session early
-                                info!("Client requested disconnect during file transfer: {}", reason);
+                                info!("Client requested disconnect: {}", reason);
                                 let response = ServerResponse::DisconnectAck;
                                 send_message(&mut stream, &response).await?;
                                 return Ok(());
@@ -406,10 +388,8 @@ impl BackupServer {
                                 send_message(&mut stream, &response).await?;
                                 return Err(anyhow::anyhow!(error_msg));
                             }
-
                         }
                     }
-
                 }
                 BackupMessage::Disconnect { reason } => {
                     info!("Client requested disconnect: {}", reason);

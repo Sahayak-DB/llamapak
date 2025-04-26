@@ -522,9 +522,22 @@ impl TlsClient {
         include_subdirectories: bool,
         file_pattern: Option<&str>,
     ) -> Result<Vec<PathBuf>> {
-        use walkdir::WalkDir;
+        use walkdir::{WalkDir, Error as WalkDirError};
+        use std::io::Error as IoError;
+
+        if !dir_path.exists() {
+            return Err(anyhow::anyhow!("Directory does not exist: {}", dir_path.display()));
+        }
+
+        if !dir_path.is_dir() {
+            return Err(anyhow::anyhow!("Path is not a directory: {}", dir_path.display()));
+        }
 
         let mut files = Vec::new();
+        let mut skipped_count = 0;
+        let mut filtered_count = 0;
+
+        // Configure directory traversal
         let walkdir = if include_subdirectories {
             WalkDir::new(dir_path)
         } else {
@@ -535,34 +548,64 @@ impl TlsClient {
         let pattern = if let Some(pattern_str) = file_pattern {
             use regex::Regex;
             match Regex::new(pattern_str) {
-                Ok(re) => Some(re),
+                Ok(re) => {
+                    info!("Using file pattern filter: '{}'", pattern_str);
+                    Some(re)
+                },
                 Err(e) => {
                     warn!("Invalid file pattern '{}': {}", pattern_str, e);
-                    None
+                    return Err(anyhow::anyhow!("Invalid file pattern '{}': {}", pattern_str, e));
                 }
             }
         } else {
             None
         };
 
-        for entry in walkdir.into_iter().filter_map(|e| e.ok()) {
-            let path = entry.path();
-
-            // Skip directories
-            if path.is_dir() {
-                continue;
-            }
-
-            // Apply pattern filter if one exists
-            if let Some(ref regex) = pattern {
-                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if !regex.is_match(file_name) {
+        // Process all entries
+        for entry_result in walkdir.into_iter() {
+            match entry_result {
+                Ok(entry) => {
+                    let path = entry.path();
+                    
+                    // Skip directories
+                    if path.is_dir() {
                         continue;
                     }
+
+                    // Apply pattern filter if one exists
+                    if let Some(ref regex) = pattern {
+                        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                            if !regex.is_match(file_name) {
+                                filtered_count += 1;
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Add to our file list
+                    files.push(path.to_path_buf());
+                },
+                Err(e) => {
+                    // Log access errors but continue
+                    warn!("Error accessing path during directory scan: {}", e);
+                    skipped_count += 1;
                 }
             }
+        }
 
-            files.push(path.to_path_buf());
+        // Log summary
+        if filtered_count > 0 {
+            info!("Filtered out {} files not matching pattern", filtered_count);
+        }
+        
+        if skipped_count > 0 {
+            warn!("Skipped {} inaccessible entries", skipped_count);
+        }
+
+        info!("Found {} files in directory {}", files.len(), dir_path.display());
+        
+        if files.is_empty() && (filtered_count > 0 || skipped_count > 0) {
+            warn!("No files found after filtering - check your pattern or permissions");
         }
 
         Ok(files)

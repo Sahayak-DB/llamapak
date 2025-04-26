@@ -343,25 +343,15 @@ impl BackupClient {
         Ok(tls_stream)
     }
     
-    pub async fn start_backup(&self, path: &Path) -> Result<()> {
-        // Check if the path exists
-        if !path.exists() {
-            return Err(anyhow::anyhow!("Path does not exist: {}", path.display()));
-        }
-        // Handle directory
-        if path.is_dir() {
-            info!("Backing up directory: {}", path.display());
-            return self.start_directory_backup(path).await;
-        }
-
-        // Otherwise proceed with single file backup
-        info!("Starting backup for file: {}", path.display());
-
+    pub async fn start_backup(&self, paths: Vec<PathBuf>) -> Result<()> {
+        // Connect to the server
         let mut stream = self.connect().await?;
 
-        // Call the helper method for backup with existing connection
-        let result = self.backup_file_with_existing_connection(&mut stream, path).await;
-
+        for path in paths {
+            // Back up the file
+            self.backup_file_with_existing_connection(&mut stream, path.as_path()).await?;
+        }
+        
         // Send disconnect message using helper function
         let disconnect_msg = BackupMessage::Disconnect {
             reason: "Backup session complete".to_string()
@@ -369,23 +359,26 @@ impl BackupClient {
 
         if let Err(e) = send_message(&mut stream, &disconnect_msg).await {
             warn!("Failed to send disconnect message: {}", e);
-        } else {
-            // Receive disconnect acknowledgment using helper function
-            match receive_message::<ServerResponse, _>(&mut stream).await {
-                Ok(ServerResponse::DisconnectAck) => {
-                    debug!("Server acknowledged disconnect request");
-                },
-                Ok(_) => {
-                    warn!("Unexpected response to disconnect request");
-                },
-                Err(e) => {
-                    warn!("Error receiving disconnect acknowledgment: {}", e);
-                }
+            return Err(anyhow::anyhow!("Failed to send disconnect message: {}", e));
+        }
+
+        // Receive disconnect acknowledgment using helper function
+        match receive_message::<ServerResponse, _>(&mut stream).await {
+            Ok(ServerResponse::DisconnectAck) => {
+                debug!("Server acknowledged disconnect request");
+                Ok(())
+            },
+            Ok(_) => {
+                let err = anyhow::anyhow!("Unexpected response to disconnect request");
+                warn!("{}", err);
+                Err(err)
+            },
+            Err(e) => {
+                warn!("Error receiving disconnect acknowledgment: {}", e);
+                Err(anyhow::anyhow!("Error receiving disconnect acknowledgment: {}", e))
             }
         }
 
-        // Return the result from the backup operation
-        result
     }
 
     /// Backup a file using an existing connection
@@ -516,117 +509,7 @@ impl BackupClient {
             _ => Err(anyhow::anyhow!("Unexpected server response for file '{}'", file_path.display())),
         }
     }
-
-    /// Start backup of multiple files/directories from settings
-    pub async fn start_backup_from_settings(&self) -> Result<()> {
-        if self.settings.backup_paths.is_empty() {
-            return Err(anyhow::anyhow!("No backup paths configured"));
-        }
-
-        info!("Starting backup of {} configured paths", self.settings.backup_paths.len());
-
-        // Connect once for all files
-        let mut stream = self.connect().await?;
-
-        // Process each path in settings
-        let mut success_count = 0;
-        let total_paths = self.settings.backup_paths.len();
-
-        for (index, path_entry) in self.settings.backup_paths.iter().enumerate() {
-            let path = Path::new(&path_entry.path);
-
-            // Skip if path doesn't exist
-            if !path.exists() {
-                warn!("Skipping non-existent path {}/{}: {}", index + 1, total_paths, path.display());
-                continue;
-            }
-
-            info!("Processing backup path {}/{}: {}", index + 1, total_paths, path.display());
-
-            if path.is_dir() && path_entry.is_directory {
-                // Process directory
-                info!("Backing up directory: {}", path.display());
-
-                // Collect files from directory
-                let files = self.collect_files_from_directory(
-                    path,
-                    path_entry.include_subdirectories,
-                    path_entry.file_pattern.as_deref(),
-                )?;
-
-                if files.is_empty() {
-                    info!("No files found in directory: {}", path.display());
-                    continue;
-                }
-
-                info!("Found {} files in directory {}", files.len(), path.display());
-
-                // Process each file in the directory
-                let mut dir_success_count = 0;
-                for file_path in &files {
-                    match self.backup_file_with_existing_connection(&mut stream, file_path).await {
-                        Ok(()) => {
-                            info!("Successfully backed up file: {}", file_path.display());
-                            dir_success_count += 1;
-                        },
-                        Err(e) => {
-                            warn!("Failed to back up file {}: {}", file_path.display(), e);
-                        }
-                    }
-                }
-
-                if dir_success_count == files.len() {
-                    info!("Directory {} backup completed successfully", path.display());
-                    success_count += 1;
-                } else {
-                    warn!("Directory {} backup completed with errors: {}/{} files succeeded",
-                     path.display(), dir_success_count, files.len());
-                }
-            } else if path.is_file() {
-                // Process single file
-                match self.backup_file_with_existing_connection(&mut stream, path).await {
-                    Ok(()) => {
-                        info!("Successfully backed up file: {}", path.display());
-                        success_count += 1;
-                    },
-                    Err(e) => {
-                        warn!("Failed to back up file {}: {}", path.display(), e);
-                    }
-                }
-            }
-        }
-
-        // Send disconnect message
-        info!("All backup paths processed. Successfully backed up {}/{} paths", success_count, total_paths);
-        let disconnect_msg = BackupMessage::Disconnect {
-            reason: "Backup from settings complete".to_string(),
-        };
-
-        if let Err(e) = send_message(&mut stream, &disconnect_msg).await {
-            warn!("Failed to send disconnect message: {}", e);
-        } else {
-            // Wait for disconnect acknowledgment
-            match receive_message::<ServerResponse, _>(&mut stream).await {
-                Ok(ServerResponse::DisconnectAck) => {
-                    info!("Server acknowledged disconnect request");
-                },
-                Ok(other) => {
-                    warn!("Unexpected response to disconnect request: {:?}", other);
-                },
-                Err(e) => {
-                    warn!("Error receiving disconnect acknowledgment: {}", e);
-                }
-            }
-        }
-
-        if success_count == total_paths {
-            info!("All backup paths processed successfully");
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Backup completed with errors: {}/{} paths succeeded", success_count, total_paths))
-        }
-    }
-
+    
     /// Collect files from a directory with optional pattern matching
     fn collect_files_from_directory(
         &self,
@@ -682,85 +565,6 @@ impl BackupClient {
         }
 
         Ok(files)
-    }
-    /// Backup a directory by sending all files within it
-    async fn start_directory_backup(&self, dir_path: &Path) -> Result<()> {
-        use walkdir::WalkDir;
-
-        info!("Starting backup for directory: {}", dir_path.display());
-
-        // Collect all files from the directory
-        let mut files = Vec::new();
-        for entry in WalkDir::new(dir_path).into_iter().filter_map(|e| e.ok()) {
-            let path = entry.path();
-
-            // Skip directories
-            if path.is_dir() {
-                continue;
-            }
-
-            info!("Adding file to backup list: {}", path.display());
-            files.push(path.to_path_buf());
-        }
-
-        if files.is_empty() {
-            info!("No files found in directory: {}", dir_path.display());
-            return Ok(());
-        }
-
-        info!("Starting multi-file backup with {} files from directory", files.len());
-
-        // Open a single connection for all files
-        let mut stream = self.connect().await?;
-
-        // Process each file in sequence
-        let mut success_count = 0;
-        let total_files = files.len();
-
-        for (index, file_path) in files.iter().enumerate() {
-            info!("Processing file {}/{}: {}", index + 1, total_files, file_path.display());
-
-            // Try to back up this specific file
-            match self.backup_file_with_existing_connection(&mut stream, file_path).await {
-                Ok(()) => {
-                    info!("Successfully backed up file: {}", file_path.display());
-                    success_count += 1;
-                },
-                Err(e) => {
-                    warn!("Failed to back up file {}: {}", file_path.display(), e);
-                }
-            }
-        }
-
-        // Send disconnect message
-        info!("Directory backup completed. Successfully backed up {}/{} files", success_count, total_files);
-        let disconnect_msg = BackupMessage::Disconnect {
-            reason: "Directory backup session complete".to_string(),
-        };
-
-        if let Err(e) = send_message(&mut stream, &disconnect_msg).await {
-            warn!("Failed to send disconnect message: {}", e);
-        } else {
-            // Wait for disconnect acknowledgment
-            match receive_message::<ServerResponse, _>(&mut stream).await {
-                Ok(ServerResponse::DisconnectAck) => {
-                    info!("Server acknowledged disconnect request");
-                },
-                Ok(other) => {
-                    warn!("Unexpected response to disconnect request: {:?}", other);
-                },
-                Err(e) => {
-                    warn!("Error receiving disconnect acknowledgment: {}", e);
-                }
-            }
-        }
-
-        if success_count == total_files {
-            info!("Directory backup completed successfully");
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Directory backup completed with errors: {}/{} files succeeded", success_count, total_files))
-        }
     }
 }
 
@@ -835,19 +639,34 @@ impl Application for BackupClient {
                 let server_address = self.server_address.clone();
                 let settings = self.settings.clone();
                 let encryption_key = self.encryption_key;
+                
+                let mut backup_op_paths: Vec<PathBuf> = Vec::new();
 
+                for path_entry in backup_paths {
+                    let path = PathBuf::from(path_entry.path);
+
+                    if path.is_dir() && path_entry.is_directory {
+                        let files_to_add = self.collect_files_from_directory(
+                            &path,
+                            path_entry.include_subdirectories, 
+                            path_entry.file_pattern.as_deref())
+                            .expect("Unable to extract a file list.");
+                        
+                        backup_op_paths.extend(files_to_add)
+                    }
+                    else {
+                        backup_op_paths.extend(Vec::from([path]));
+                    }
+                }
+                
                 Command::perform(
                     async move {
                         let mut errors = Vec::new();
-
-                        for path_entry in backup_paths {
-                            let path = PathBuf::from(path_entry.path);
-                            match start_backup_async(path.clone(), server_address.clone(), settings.clone(), encryption_key).await {
-                                Ok(_) => {},
-                                Err(e) => errors.push(format!("Error backing up {}: {}", path.display(), e)),
-                            }
+                        
+                        match start_backup_async(backup_op_paths.clone(), server_address.clone(), settings.clone(), encryption_key).await {
+                            Ok(_) => {},
+                            Err(e) => errors.push(format!("Errors backing up: {}", e)),
                         }
-
                         if errors.is_empty() {
                             Ok(())
                         } else {
@@ -1410,32 +1229,11 @@ struct OperationLog {
 }
 
 async fn start_backup_async(
-    file_path: PathBuf, 
-    server_addr: String, 
+    file_paths: Vec<PathBuf>,
+    server_addr: String,
     settings: ClientSettings,
     encryption_key: [u8; 32]
 ) -> Result<(), anyhow::Error> {
-    // Validate the file path
-    if !file_path.exists() {
-        return Err(anyhow::anyhow!("File does not exist: {:?}", file_path));
-    }
-
-    if file_path.is_dir() {
-        return Err(anyhow::anyhow!("Path is a directory, not a file: {:?}", file_path));
-    }
-
-    // Get file metadata to ensure it's readable
-    match tokio::fs::metadata(&file_path).await {
-        Ok(metadata) => {
-            if metadata.len() == 0 {
-                warn!("File is empty: {:?}", file_path);
-                // You might want to return an error here, or continue anyway
-            }
-        },
-        Err(e) => {
-            return Err(anyhow::anyhow!("Cannot read file metadata: {} - Error: {}", file_path.display(), e));
-        }
-    }
 
     // Create a new client instance
     let mut client = BackupClient::new(server_addr, settings.server_port);
@@ -1450,7 +1248,7 @@ async fn start_backup_async(
 
     // Start the actual backup process
     client
-        .start_backup(&file_path)
+        .start_backup(file_paths.clone())
         .await
         .context("Backup operation failed")?;
 
@@ -1458,13 +1256,13 @@ async fn start_backup_async(
     client.settings.add_log_entry(
         "Backup".to_string(),
         OperationStatus::Success,
-        format!("Completed backup of {:?}", file_path)
+        format!("Completed backup of {:?} paths.", file_paths.len())
     );
     
     // Save updated settings
     client.save_settings().await?;
 
-    info!("Backup completed successfully for file: {:?}", file_path);
+    info!("Backup completed successfully.");
     Ok(())
 }
 
