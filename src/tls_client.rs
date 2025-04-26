@@ -102,35 +102,35 @@ impl TlsClient {
             Ok(stream) => {
                 info!("TCP connection established to {}", server_addr);
                 
-                // Log the domain name we're using for validation
+                // Determine the appropriate ServerName based on whether address is IP or hostname
                 let domain_str = self.connection_config.server_address.as_str();
                 info!("Using server name '{}' for TLS validation", domain_str);
                 
-                match ServerName::try_from(domain_str) {
-                    Ok(domain) => {
-                        debug!("ServerName successfully parsed from '{}'", domain_str);
-                        
-                        match self.connector.connect(domain, stream).await {
-                            Ok(tls_stream) => {
-                                info!("TLS handshake successful with {}", server_addr);
-                                Ok(tls_stream)
-                            },
-                            Err(e) => {
-                                // Detailed error logging for TLS failure
-                                let error_details = format!("{:?}", e);
-                                warn!("TLS handshake failed: {}", error_details);
-                                if error_details.contains("BadCertificate") {
-                                    warn!("Certificate was rejected by peer (BadCertificate)");
-                                } else if error_details.contains("UnknownCA") {
-                                    warn!("Server certificate not trusted (UnknownCA)");
-                                }
-                                Err(anyhow::anyhow!("TLS connection failed: {}", e))
-                            }
-                        }
+                let server_name = if domain_str.parse::<std::net::IpAddr>().is_ok() {
+                    // For IP addresses, use "localhost" as a DNS name (which should be in the cert)
+                    ServerName::try_from("localhost")?
+                } else {
+                    // For hostnames, use as-is
+                    ServerName::try_from(domain_str)?
+                };
+                
+                debug!("ServerName successfully parsed for TLS validation");
+                
+                match self.connector.connect(server_name, stream).await {
+                    Ok(tls_stream) => {
+                        info!("TLS handshake successful with {}", server_addr);
+                        Ok(tls_stream)
                     },
                     Err(e) => {
-                        warn!("Failed to parse ServerName from '{}': {}", domain_str, e);
-                        Err(anyhow::anyhow!("Invalid server name for TLS: {}", e))
+                        // Detailed error logging for TLS failure
+                        let error_details = format!("{:?}", e);
+                        warn!("TLS handshake failed: {}", error_details);
+                        if error_details.contains("BadCertificate") {
+                            warn!("Certificate was rejected by peer (BadCertificate)");
+                        } else if error_details.contains("UnknownCA") {
+                            warn!("Server certificate not trusted (UnknownCA)");
+                        }
+                        Err(anyhow::anyhow!("TLS connection failed: {}", e))
                     }
                 }
             },

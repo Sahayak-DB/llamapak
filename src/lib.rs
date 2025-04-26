@@ -9,6 +9,7 @@ use std::io::SeekFrom;
 use std::path::PathBuf;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tracing::{debug, warn};
 
 pub const MIN_CHUNK_SIZE: u64 = 64 * 1024; // 64KB
 pub const MAX_CHUNK_SIZE: u64 = 10 * 1024 * 1024; // 10MB
@@ -37,6 +38,8 @@ where
     let data = serde_json::to_vec(message).context("Failed to serialize message")?;
     let len = data.len() as u32;
 
+    debug!("Sending message with length: {}", len);
+
     // Send message length first
     stream
         .write_all(&len.to_be_bytes())
@@ -53,29 +56,35 @@ where
     Ok(())
 }
 
-/// Receives a message from a TLS stream
 pub async fn receive_message<T: DeserializeOwned, S>(stream: &mut S) -> Result<T>
 where
     S: AsyncReadExt + Unpin,
 {
     // Read message length
     let mut len_bytes = [0u8; 4];
-    stream
-        .read_exact(&mut len_bytes)
-        .await
-        .context("Failed to read message length")?;
-    let len = u32::from_be_bytes(len_bytes);
+    debug!("Waiting to read message length");
+    
+    match stream.read_exact(&mut len_bytes).await {
+        Ok(_) => {
+            let len = u32::from_be_bytes(len_bytes);
+            debug!("Received message length: {}", len);
+            
+            // Read message data
+            let mut buffer = vec![0u8; len as usize];
+            stream
+                .read_exact(&mut buffer)
+                .await
+                .context("Failed to read message data")?;
 
-    // Read message data
-    let mut buffer = vec![0u8; len as usize];
-    stream
-        .read_exact(&mut buffer)
-        .await
-        .context("Failed to read message data")?;
-
-    // Deserialize response
-    let message: T = serde_json::from_slice(&buffer).context("Failed to deserialize message")?;
-    Ok(message)
+            // Deserialize response
+            let message: T = serde_json::from_slice(&buffer).context("Failed to deserialize message")?;
+            Ok(message)
+        },
+        Err(e) => {
+            warn!("Failed to read message length: {}", e);
+            Err(anyhow::anyhow!("Failed to read message length: {}", e))
+        }
+    }
 }
 
 /// Calculate SHA-256 hash of data

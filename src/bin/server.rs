@@ -230,15 +230,17 @@ impl BackupServer {
                 Ok(msg) => msg,
                 Err(e) => {
                     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                        if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
-                            // Client disconnected
+                        if io_err.kind() == std::io::ErrorKind::UnexpectedEof || 
+                           io_err.kind() == std::io::ErrorKind::ConnectionReset ||
+                           io_err.kind() == std::io::ErrorKind::ConnectionAborted {
+                            info!("Client disconnected");
                             break;
                         }
                     }
                     return Err(e);
                 }
             };
-
+            
             match message {
                 BackupMessage::InitBackup(request) => {
                     let file_path = storage_path.join(&request.file_info.path);
@@ -525,7 +527,7 @@ fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()> {
     // Set subject alternative names
     params.subject_alt_names = vec![
         SanType::DnsName("localhost".to_string()),
-        SanType::DnsName("127.0.0.1".to_string()),
+        SanType::IpAddress("127.0.0.1".to_string().parse()?),
     ];
 
     // Generate the certificate
