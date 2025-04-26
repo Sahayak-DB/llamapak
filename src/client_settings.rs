@@ -32,6 +32,9 @@ pub struct ClientSettings {
     pub log_file_path: String,
     pub recent_operations: Vec<LogEntry>,
 
+    // Backup settings
+    pub backup_file_path: String,  // Add this field
+    
     // Additional settings
     pub auto_update: bool,
     pub default_download_path: String,
@@ -86,6 +89,9 @@ impl Default for ClientSettings {
             log_to_file: true,
             log_file_path: "./logs/client.log".to_string(),
             recent_operations: Vec::new(),
+
+            // Backup settings
+            backup_file_path: "./backups/".to_string(),
 
             // Additional settings
             auto_update: true,

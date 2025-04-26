@@ -22,6 +22,7 @@ use llamapak::tls_client::TlsClient;
 #[derive(Debug, Clone)]
 enum Message {
     SetBackupPath(String),
+    BrowseForBackupFile,
     StartBackup,
     StopBackup,
     OpenSettings,
@@ -416,10 +417,16 @@ impl Application for BackupClient {
     fn update(&mut self, message: Message) -> iced::Command<Message> {
         match message {
             Message::SetBackupPath(path) => {
-                self.backup_path = path;
+                self.backup_path = path.clone();
+                self.settings.backup_file_path = path;
                 iced::Command::none()
             }
             Message::StartBackup => {
+                if self.settings.backup_file_path.is_empty() {
+                    self.status = "Error: No backup file path specified".to_string();
+                    return iced::Command::none();
+                }
+
                 self.status = "Initializing backup...".to_string();
                 self.is_running = true;  // Add this line
                 
@@ -680,6 +687,19 @@ impl Application for BackupClient {
                 }
                 iced::Command::none()
             }
+            Message::BrowseForBackupFile => {
+                // TODO: This is a placeholder. In a real implementation, you would:
+                // 1. Use a native file dialog library like rfd
+                // 2. Get the selected file path
+                // 3. Update self.settings.backup_file_path
+
+                // For now, just set a test file path
+                self.settings.backup_file_path = String::from("./backups/key.pem");
+                self.backup_path = self.settings.backup_file_path.clone();
+
+                iced::Command::none()
+            }
+
         }
     }
     
@@ -689,6 +709,17 @@ impl Application for BackupClient {
             let settings_form = column![
                 text("Client Settings").size(24),
                 
+                // Backup file settings
+                text("Backup File Path:").size(16),
+                row![
+                    text_input("Enter file path...", &self.settings.backup_file_path)
+                        .on_input(Message::SetBackupPath)
+                        .width(Length::FillPortion(5)),
+                    button(text("Browse..."))
+                        .on_press(Message::BrowseForBackupFile)
+                        .width(Length::FillPortion(1)),
+                ].spacing(10),
+                    
                 // Server settings
                 text("Server IP:").size(16),
                 text_input("127.0.0.1", &self.new_server_ip)
@@ -861,6 +892,28 @@ async fn start_backup_async(
     settings: ClientSettings,
     encryption_key: [u8; 32]
 ) -> Result<(), anyhow::Error> {
+    // Validate the file path
+    if !file_path.exists() {
+        return Err(anyhow::anyhow!("File does not exist: {:?}", file_path));
+    }
+
+    if file_path.is_dir() {
+        return Err(anyhow::anyhow!("Path is a directory, not a file: {:?}", file_path));
+    }
+
+    // Get file metadata to ensure it's readable
+    match tokio::fs::metadata(&file_path).await {
+        Ok(metadata) => {
+            if metadata.len() == 0 {
+                warn!("File is empty: {:?}", file_path);
+                // You might want to return an error here, or continue anyway
+            }
+        },
+        Err(e) => {
+            return Err(anyhow::anyhow!("Cannot read file metadata: {} - Error: {}", file_path.display(), e));
+        }
+    }
+
     // Create a new client instance
     let mut client = BackupClient::new(server_addr, settings.server_port);
     client.settings = settings;
