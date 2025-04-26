@@ -54,6 +54,17 @@ pub fn initialize_logging(config: LoggerConfig) -> anyhow::Result<()> {
         .lock()
         .map_err(|e| anyhow::anyhow!("Failed to lock global guard: {}", e))? = Some(guard);
 
+    // Create a filter that excludes noisy modules
+    let target_filter = tracing_subscriber::filter::Targets::new()
+        // Set default level to debug or your desired level
+        .with_default(config.log_level)
+        // Filter out noisy crates
+        .with_target("cosmic_text", LevelFilter::WARN)
+        .with_target("wgpu", LevelFilter::WARN)
+        .with_target("winit", LevelFilter::WARN)
+        .with_target("naga", LevelFilter::WARN)
+        .with_target("iced", LevelFilter::WARN);
+
     // Create the file logging layer
     let file_layer = if config.json_format {
         fmt::layer()
@@ -78,13 +89,10 @@ pub fn initialize_logging(config: LoggerConfig) -> anyhow::Result<()> {
         .with_ansi(true)
         .with_writer(std::io::stdout);
 
-    // Convert tracing::Level to tracing_subscriber::filter::LevelFilter
-    let level_filter = LevelFilter::from_level(config.log_level);
-
     // Combine layers with a Registry subscriber
     Registry::default()
-        .with(file_layer.with_filter(level_filter.clone()))
-        .with(stdout_layer.with_filter(level_filter))
+        .with(file_layer.with_filter(target_filter.clone()))
+        .with(stdout_layer.with_filter(target_filter))
         .try_init()
         .map_err(|e| anyhow::anyhow!("Failed to initialize logger: {}", e))?;
 

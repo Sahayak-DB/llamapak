@@ -3,8 +3,8 @@ use crate::{
     FileInfo, ServerResponse, DEFAULT_CHUNK_SIZE,
 };
 use anyhow::Result;
-use rustls::ServerName;
-use rustls::{Certificate, ClientConfig, RootCertStore};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, RootCertStore};
 use rustls_pemfile;
 use sha2::Digest;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::{rustls, TlsConnector};
+use tracing::instrument::WithSubscriber;
 use tracing::{debug, info, warn};
 
 /// A client for secure file operations over TLS
@@ -24,13 +25,14 @@ pub struct TlsClient {
 impl TlsClient {
     /// Create a new TLS client with the given configuration
     pub fn new(connection_config: ConnectionConfig) -> Self {
+        let root_store = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
         let config = ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(RootCertStore::empty())
+            .with_root_certificates(root_store)
             .with_no_client_auth();
-        
-        let connector = TlsConnector::from(Arc::new(config.clone()));
-        
+
+        // Create the connector from the config
+        let connector = TlsConnector::from(Arc::new(config));
         Self {
             connector,
             connection_config,
@@ -38,47 +40,19 @@ impl TlsClient {
     }
     /// Initialize the TLS client with the required certificates
     pub async fn initialize(&mut self, cert_path: Option<&Path>) -> Result<()> {
-        let mut root_store = RootCertStore::empty();
-
-        // Add system root certificates
-        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject,
-                ta.spki,
-                ta.name_constraints,
-            )
-        }));
-        info!("Added system root certificates to trust store");
+        let mut root_store = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
         // Add custom certificate if provided
         if let Some(path) = cert_path {
             info!("Loading custom certificate from path: {:?}", path);
-            match tokio::fs::read(path).await {
-                Ok(server_cert) => {
-                    let certs_result = rustls_pemfile::certs(&mut server_cert.as_slice())
-                        .collect::<Result<Vec<_>, _>>();
-                    
-                    match certs_result {
-                        Ok(certs) => {
-                            info!("Found {} certificates in provided cert file", certs.len());
-                            for (i, cert) in certs.iter().enumerate() {
-                                match root_store.add(&Certificate(cert.to_vec())) {
-                                    Ok(_) => info!("Successfully added certificate #{} to trust store", i+1),
-                                    Err(e) => warn!("Failed to add certificate #{} to trust store: {}", i+1, e),
-                                }
-                            }
-                        },
-                        Err(e) => warn!("Failed to parse certificates from file: {:?}", e),
-                    }
-                },
-                Err(e) => warn!("Failed to read certificate file: {:?}", e),
+            if let Err(e) = process_certificate_file(path, &mut root_store).await {
+                warn!("Error processing certificate file: {}", e);
             }
         } else {
             info!("No custom certificate provided, using only system certificates");
         }
 
         let config = ClientConfig::builder()
-            .with_safe_defaults()
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
@@ -91,34 +65,37 @@ impl TlsClient {
     pub async fn connect(&self) -> Result<TlsStream<TcpStream>> {
         let server_addr = format!(
             "{}:{}",
-            self.connection_config.server_address, self.connection_config.server_port
+            self.connection_config.server_address.clone()
+            , self.connection_config.server_port.clone()
+
         );
+        let domain_str = self.connection_config.server_address.clone();
+        let connector = self.connector.clone();
 
         info!("Attempting to connect to server at {}", server_addr);
 
         match TcpStream::connect(&server_addr).await {
             Ok(stream) => {
                 info!("TCP connection established to {}", server_addr);
-                
+
                 // Determine the appropriate ServerName based on whether address is IP or hostname
-                let domain_str = self.connection_config.server_address.as_str();
                 info!("Using server name '{}' for TLS validation", domain_str);
-                
+
                 let server_name = if domain_str.parse::<std::net::IpAddr>().is_ok() {
                     // For IP addresses, use "localhost" as a DNS name (which should be in the cert)
-                    ServerName::try_from("localhost")?
+                    ServerName::try_from("localhost")? //TODO: A spud wrote this, clearly.
                 } else {
                     // For hostnames, use as-is
                     ServerName::try_from(domain_str)?
                 };
-                
+
                 debug!("ServerName successfully parsed for TLS validation");
                 
-                match self.connector.connect(server_name, stream).await {
+                match connector.connect(server_name, stream).await {
                     Ok(tls_stream) => {
                         info!("TLS handshake successful with {}", server_addr);
                         Ok(tls_stream)
-                    },
+                    }
                     Err(e) => {
                         // Detailed error logging for TLS failure
                         let error_details = format!("{:?}", e);
@@ -131,7 +108,7 @@ impl TlsClient {
                         Err(anyhow::anyhow!("TLS connection failed: {}", e))
                     }
                 }
-            },
+            }
             Err(e) => {
                 warn!("TCP connection to {} failed: {}", server_addr, e);
                 Err(anyhow::anyhow!("Failed to connect to server: {}", e))
@@ -306,15 +283,25 @@ impl TlsClient {
         let mut stream = self.connect().await?;
         let mut results = Vec::new();
 
-        info!("Starting multi-file backup session with {} files", file_paths.len());
+        info!(
+            "Starting multi-file backup session with {} files",
+            file_paths.len()
+        );
 
         // Process each file
         for file_path in file_paths {
-            match self.send_file_over_existing_connection(&mut stream, file_path, preferred_chunk_size).await {
+            match self
+                .send_file_over_existing_connection(&mut stream, file_path, preferred_chunk_size)
+                .await
+            {
                 Ok(verified) => {
-                    info!("File '{}' transfer completed, verified: {}", file_path.display(), verified);
+                    info!(
+                        "File '{}' transfer completed, verified: {}",
+                        file_path.display(),
+                        verified
+                    );
                     results.push((file_path.clone(), verified));
-                },
+                }
                 Err(e) => {
                     warn!("Failed to transfer file '{}': {}", file_path.display(), e);
                     results.push((file_path.clone(), false));
@@ -335,10 +322,10 @@ impl TlsClient {
             match receive_message::<ServerResponse, _>(&mut stream).await {
                 Ok(ServerResponse::DisconnectAck) => {
                     info!("Server acknowledged disconnect request");
-                },
+                }
                 Ok(other) => {
                     warn!("Unexpected response to disconnect request: {:?}", other);
-                },
+                }
                 Err(e) => {
                     warn!("Error receiving disconnect acknowledgment: {}", e);
                 }
@@ -359,7 +346,11 @@ impl TlsClient {
         let file_metadata = tokio::fs::metadata(file_path).await?;
         let file_size = file_metadata.len();
 
-        info!("Sending file '{}' ({} bytes) to server", file_path.display(), file_size);
+        info!(
+            "Sending file '{}' ({} bytes) to server",
+            file_path.display(),
+            file_size
+        );
 
         // Request chunk size (use default if not specified)
         let requested_chunk_size = preferred_chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
@@ -381,7 +372,9 @@ impl TlsClient {
         // Get negotiated chunk size from server
         let response = receive_message::<ServerResponse, _>(stream).await?;
         let actual_chunk_size = match response {
-            ServerResponse::Ready { negotiated_chunk_size } => {
+            ServerResponse::Ready {
+                negotiated_chunk_size,
+            } => {
                 info!(
                     "Server ready to receive file '{}' with chunk size: {} bytes",
                     file_path.display(),
@@ -428,7 +421,10 @@ impl TlsClient {
             // Wait for chunk receipt confirmation
             let response = receive_message::<ServerResponse, _>(stream).await?;
             match response {
-                ServerResponse::ChunkReceived { offset: resp_offset, verified } => {
+                ServerResponse::ChunkReceived {
+                    offset: resp_offset,
+                    verified,
+                } => {
                     if resp_offset != offset {
                         return Err(anyhow::anyhow!(
                             "Server acknowledged wrong chunk offset: {} (expected {})",
@@ -437,7 +433,10 @@ impl TlsClient {
                         ));
                     }
                     if !verified {
-                        return Err(anyhow::anyhow!("Chunk verification failed at offset {}", offset));
+                        return Err(anyhow::anyhow!(
+                            "Chunk verification failed at offset {}",
+                            offset
+                        ));
                     }
                     // Log only occasionally to avoid excessive logging
                     if chunks_count % 100 == 0 || chunks_count == 0 {
@@ -463,7 +462,10 @@ impl TlsClient {
         let file_hash = format!("{:x}", hasher.finalize());
 
         // Send completion message
-        info!("File '{}' transfer complete, sending completion message", file_path.display());
+        info!(
+            "File '{}' transfer complete, sending completion message",
+            file_path.display()
+        );
         let complete_message = BackupMessage::Complete {
             hash: file_hash.clone(),
             chunks_count,
@@ -475,17 +477,25 @@ impl TlsClient {
         match response {
             ServerResponse::BackupComplete { verified } => {
                 if verified {
-                    info!("File '{}' sent and verified successfully", file_path.display());
+                    info!(
+                        "File '{}' sent and verified successfully",
+                        file_path.display()
+                    );
                     Ok(true)
                 } else {
-                    warn!("File '{}' sent but verification failed", file_path.display());
+                    warn!(
+                        "File '{}' sent but verification failed",
+                        file_path.display()
+                    );
                     Ok(false)
                 }
             }
             ServerResponse::Error(msg) => {
                 Err(anyhow::anyhow!("Server error during completion: {}", msg))
             }
-            _ => Err(anyhow::anyhow!("Unexpected server response during completion")),
+            _ => Err(anyhow::anyhow!(
+                "Unexpected server response during completion"
+            )),
         }
     }
 
@@ -500,14 +510,22 @@ impl TlsClient {
         info!("Preparing to backup directory: {}", dir_path.display());
 
         // Collect all files from the directory
-        let files = self.collect_files_from_directory(dir_path, include_subdirectories, file_pattern)?;
+        let files =
+            self.collect_files_from_directory(dir_path, include_subdirectories, file_pattern)?;
 
         if files.is_empty() {
-            info!("No files found in directory {} matching pattern", dir_path.display());
+            info!(
+                "No files found in directory {} matching pattern",
+                dir_path.display()
+            );
             return Ok(Vec::new());
         }
 
-        info!("Found {} files to backup in directory {}", files.len(), dir_path.display());
+        info!(
+            "Found {} files to backup in directory {}",
+            files.len(),
+            dir_path.display()
+        );
 
         // Send all files in one session
         self.send_multiple_files(&files, preferred_chunk_size).await
@@ -523,11 +541,17 @@ impl TlsClient {
         use walkdir::WalkDir;
 
         if !dir_path.exists() {
-            return Err(anyhow::anyhow!("Directory does not exist: {}", dir_path.display()));
+            return Err(anyhow::anyhow!(
+                "Directory does not exist: {}",
+                dir_path.display()
+            ));
         }
 
         if !dir_path.is_dir() {
-            return Err(anyhow::anyhow!("Path is not a directory: {}", dir_path.display()));
+            return Err(anyhow::anyhow!(
+                "Path is not a directory: {}",
+                dir_path.display()
+            ));
         }
 
         let mut files = Vec::new();
@@ -548,10 +572,14 @@ impl TlsClient {
                 Ok(re) => {
                     info!("Using file pattern filter: '{}'", pattern_str);
                     Some(re)
-                },
+                }
                 Err(e) => {
                     warn!("Invalid file pattern '{}': {}", pattern_str, e);
-                    return Err(anyhow::anyhow!("Invalid file pattern '{}': {}", pattern_str, e));
+                    return Err(anyhow::anyhow!(
+                        "Invalid file pattern '{}': {}",
+                        pattern_str,
+                        e
+                    ));
                 }
             }
         } else {
@@ -563,7 +591,7 @@ impl TlsClient {
             match entry_result {
                 Ok(entry) => {
                     let path = entry.path();
-                    
+
                     // Skip directories
                     if path.is_dir() {
                         continue;
@@ -581,7 +609,7 @@ impl TlsClient {
 
                     // Add to our file list
                     files.push(path.to_path_buf());
-                },
+                }
                 Err(e) => {
                     // Log access errors but continue
                     warn!("Error accessing path during directory scan: {}", e);
@@ -594,13 +622,17 @@ impl TlsClient {
         if filtered_count > 0 {
             info!("Filtered out {} files not matching pattern", filtered_count);
         }
-        
+
         if skipped_count > 0 {
             warn!("Skipped {} inaccessible entries", skipped_count);
         }
 
-        info!("Found {} files in directory {}", files.len(), dir_path.display());
-        
+        info!(
+            "Found {} files in directory {}",
+            files.len(),
+            dir_path.display()
+        );
+
         if files.is_empty() && (filtered_count > 0 || skipped_count > 0) {
             warn!("No files found after filtering - check your pattern or permissions");
         }
@@ -608,13 +640,10 @@ impl TlsClient {
         Ok(files)
     }
 
-
     /// Get the TLS connector
     pub fn get_connector(&self) -> TlsConnector {
         self.connector.clone()
     }
-
-
 }
 
 // Convenience function to create and initialize a client with defaults
@@ -632,4 +661,37 @@ pub async fn create_default_client(
     client.initialize(cert_path).await?;
 
     Ok(client)
+}
+
+async fn process_certificate_file(path: &Path, root_store: &mut RootCertStore) -> Result<()> {
+    let server_cert = tokio::fs::read(path).await
+        .map_err(|e| {
+            warn!("Failed to read certificate file: {:?}", e);
+            anyhow::anyhow!("Failed to read certificate file: {}", e)
+        })?;
+
+    let certs = rustls_pemfile::certs(&mut server_cert.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            warn!("Failed to parse certificates from file: {:?}", e);
+            anyhow::anyhow!("Failed to parse certificates: {}", e)
+        })?;
+
+    info!("Found {} certificates in provided cert file", certs.len());
+
+    // Process each certificate
+    for (i, cert_data) in certs.iter().enumerate() {
+        let cert_der = rustls::pki_types::CertificateDer::from(cert_data.to_vec());
+        let result = root_store.add_parsable_certificates([cert_der]);
+
+        let (successful, total) = result;
+        if successful == total {
+            info!("Successfully added certificate #{} to trust store", i + 1);
+        } else {
+            warn!("Failed to fully add certificate #{} to trust store: added {}/{}", 
+                  i + 1, successful, total);
+        }
+    }
+
+    Ok(())
 }

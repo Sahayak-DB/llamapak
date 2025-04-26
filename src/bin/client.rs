@@ -1,14 +1,17 @@
 use anyhow::{Context, Result};
-use iced::theme::Theme::{SolarizedDark, SolarizedLight};
-use iced::widget::{button, column, container, horizontal_rule, row, text, text_input, Container, Space};
+use iced::widget::{
+    button, column, container, horizontal_rule, row, text, text_input, Container, Space,
+};
 use iced::window::Position;
-use iced::{Application, Command, Element, Length, Settings, Size, Theme};
+use iced::{Application, Color, Command, Element, Length, Settings, Size, Theme};
 use std::path::{Path, PathBuf};
 use tokio::net::TcpStream;
-use tokio_rustls::{rustls, TlsConnector};
 use tokio_rustls::client::TlsStream;
+use tokio_rustls::{rustls, TlsConnector};
 use tracing::{debug, info, warn};
 
+use llamapak::client_settings::BackupPathEntry;
+use llamapak::tls_client::TlsClient;
 use llamapak::{
     calculate_hash,
     client_settings::{ClientSettings, LogLevel, OperationStatus},
@@ -16,8 +19,6 @@ use llamapak::{
     receive_message, send_message, BackupMessage, BackupRequest, ChunkedFileOperation,
     ConnectionConfig, FileInfo, ServerResponse,
 };
-use llamapak::client_settings::BackupPathEntry;
-use llamapak::tls_client::TlsClient;
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -41,7 +42,7 @@ enum Message {
     SettingsSaved(Result<(), String>),
     SyncSettings,
     AddBackupPath,
-    RemoveBackupPath(usize),  // Index of the path to remove
+    RemoveBackupPath(usize),    // Index of the path to remove
     SelectBackupPathType(bool), // true for directory, false for file
     SetBackupPathIncludeSubdirs(bool),
     SetBackupPathPattern(String),
@@ -53,15 +54,7 @@ struct FileDownloadOperation {
     file_operation: ChunkedFileOperation,
 }
 
-impl FileDownloadOperation {
-    async fn receive_chunk(&mut self, offset: u64, data: Vec<u8>, chunk_hash: String) -> bool {
-        self.file_operation.add_chunk(offset, data, chunk_hash)
-    }
-
-    async fn complete_download(&self) -> Result<bool> {
-        self.file_operation.save_to_file().await
-    }
-}
+impl FileDownloadOperation {}
 
 #[derive(Clone)]
 struct BackupClient {
@@ -72,7 +65,6 @@ struct BackupClient {
     space_used: u64,
     space_available: u64,
     schedule: String,
-    should_exit: bool,
     server_address: String,
     server_port: u16,
     connector: Option<TlsConnector>,
@@ -85,7 +77,6 @@ struct BackupClient {
     is_directory_backup: bool,
     include_subdirectories: bool,
     file_pattern: String,
-
 }
 
 impl BackupClient {
@@ -117,14 +108,14 @@ impl BackupClient {
                 size_transferred: 1316090,
             },
         ];
-        
+
         // Create a default settings object
         let settings = ClientSettings::new();
-        
+
         // Generate a persistent encryption key - in production this should be stored securely
         // For demo purposes, we'll use a static key
         let encryption_key = [42u8; 32]; // Fixed key for demo
-        
+
         Self {
             backup_path: String::new(),
             status: String::new(),
@@ -133,7 +124,6 @@ impl BackupClient {
             space_used: 1024 * 1024 * 100,
             space_available: 1024 * 1024 * 1000,
             schedule: "Daily at 11:30".to_string(),
-            should_exit: false,
             server_address: server_address.clone(),
             server_port,
             connector: None,
@@ -146,28 +136,36 @@ impl BackupClient {
             is_directory_backup: true, // Default to directory backup
             include_subdirectories: true,
             file_pattern: String::new(),
-
         }
     }
 
     fn view_backup_paths(&self) -> Element<Message> {
-        let paths: Vec<Element<_>> = self.settings.backup_paths
+        let paths: Vec<Element<_>> = self
+            .settings
+            .backup_paths
             .iter()
             .enumerate()
             .map(|(index, entry)| {
                 row![
                     // Path type icon (folder or file)
                     text(if entry.is_directory { "📁" } else { "📄" }).size(16),
-                    
                     // Path details
                     column![
                         text(&entry.path).size(16),
                         if entry.is_directory {
                             text(format!(
                                 "Include subdirs: {}{}",
-                                if entry.include_subdirectories { "Yes" } else { "No" },
-                                entry.file_pattern.as_ref().map_or("".to_string(), |p| format!(", Pattern: {}", p))
-                            )).size(14)
+                                if entry.include_subdirectories {
+                                    "Yes"
+                                } else {
+                                    "No"
+                                },
+                                entry
+                                    .file_pattern
+                                    .as_ref()
+                                    .map_or("".to_string(), |p| format!(", Pattern: {}", p))
+                            ))
+                            .size(14)
                         } else {
                             text("").size(14)
                         },
@@ -175,42 +173,38 @@ impl BackupClient {
                             text(format!(
                                 "Last backup: {}",
                                 chrono::DateTime::from_timestamp(time as i64, 0)
-                                    .map_or("Invalid time".to_string(), |dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                            )).size(14)
+                                    .map_or("Invalid time".to_string(), |dt| dt
+                                        .format("%Y-%m-%d %H:%M")
+                                        .to_string())
+                            ))
+                            .size(14)
                         } else {
                             text("Never backed up").size(14)
                         },
-                    ].width(Length::Fill),
-                    
+                    ]
+                    .width(Length::Fill),
                     // Remove button
                     button(text("❌"))
                         .on_press(Message::RemoveBackupPath(index))
                         .style(iced::theme::Button::Destructive),
                 ]
-                    .spacing(10)
-                    .padding(5)
-                    .width(Length::Fill)
-                    .into()
+                .spacing(10)
+                .padding(5)
+                .width(Length::Fill)
+                .into()
             })
             .collect();
 
         if paths.is_empty() {
             // Show message when no paths are configured
-            container(
-                text("No backup paths configured. Add one below.")
-                    .size(16)
-            )
+            container(text("No backup paths configured. Add one below.").size(16))
                 .width(Length::Fill)
                 .center_x()
                 .padding(10)
                 .into()
         } else {
             // Show scrollable list of paths
-            iced::widget::scrollable(
-                column(paths)
-                    .spacing(5)
-                    .width(Length::Fill)
-            )
+            iced::widget::scrollable(column(paths).spacing(5).width(Length::Fill))
                 .height(Length::from(200))
                 .into()
         }
@@ -219,7 +213,7 @@ impl BackupClient {
     pub async fn initialize(&mut self) -> Result<()> {
         // Load settings first
         self.load_settings().await?;
-        
+
         // Use settings for configuration
         self.server_address = self.settings.server_ip.clone();
         self.server_port = self.settings.server_port;
@@ -233,7 +227,10 @@ impl BackupClient {
             let cert_option = if cert_path.exists() {
                 Some(cert_path)
             } else {
-                warn!("Server certificate not found at {}. Using system certificates only.", cert_path.display());
+                warn!(
+                    "Server certificate not found at {}. Using system certificates only.",
+                    cert_path.display()
+                );
                 None
             };
 
@@ -251,7 +248,7 @@ impl BackupClient {
                     info!("TLS connection initialized successfully");
                     // Add a getter method to TlsClient to access the connector
                     self.connector = Some(tls_client.get_connector());
-                },
+                }
                 Err(e) => {
                     warn!("Failed to initialize TLS connection: {}", e);
                     return Err(anyhow::anyhow!("TLS initialization failed: {}", e));
@@ -265,10 +262,9 @@ impl BackupClient {
         Ok(())
     }
 
-
     pub async fn load_settings(&mut self) -> Result<()> {
         let settings_path = ClientSettings::default_local_path();
-        
+
         if settings_path.exists() {
             // Try to load existing settings
             match ClientSettings::load(&settings_path, &self.encryption_key) {
@@ -289,37 +285,37 @@ impl BackupClient {
             self.settings = ClientSettings::new();
             self.settings.save(&settings_path, &self.encryption_key)?;
         }
-        
+
         Ok(())
     }
-    
+
     pub async fn save_settings(&self) -> Result<()> {
         let settings_path = ClientSettings::default_local_path();
         self.settings.save(&settings_path, &self.encryption_key)?;
         info!("Settings saved to {}", settings_path.display());
         Ok(())
     }
-    
+
     pub async fn sync_settings_with_server(&mut self) -> Result<()> {
-        // Sync settings with server 
+        // Sync settings with server
         self.settings.sync_with_server(
             &format!("{}:{}", self.settings.server_ip, self.settings.server_port),
-            &self.encryption_key
+            &self.encryption_key,
         )?;
-        
+
         // Add a log entry for this operation
         self.settings.add_log_entry(
             "Settings Sync".to_string(),
             OperationStatus::Success,
-            "Synchronized settings with server".to_string()
+            "Synchronized settings with server".to_string(),
         );
-        
+
         // Save updated settings with the new log entry
         self.save_settings().await?;
-        
+
         Ok(())
     }
-    
+
     pub async fn connect(&self) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let connector = self
             .connector
@@ -337,19 +333,20 @@ impl BackupClient {
 
         Ok(tls_stream)
     }
-    
+
     pub async fn start_backup(&self, paths: Vec<PathBuf>) -> Result<()> {
         // Connect to the server
         let mut stream = self.connect().await?;
 
         for path in paths {
             // Back up the file
-            self.backup_file_with_existing_connection(&mut stream, path.as_path()).await?;
+            self.backup_file_with_existing_connection(&mut stream, path.as_path())
+                .await?;
         }
 
         // Send disconnect message using helper function
         let disconnect_msg = BackupMessage::Disconnect {
-            reason: "Backup session complete".to_string()
+            reason: "Backup session complete".to_string(),
         };
 
         if let Err(e) = send_message(&mut stream, &disconnect_msg).await {
@@ -362,23 +359,32 @@ impl BackupClient {
             Ok(ServerResponse::DisconnectAck) => {
                 debug!("Server acknowledged disconnect request");
                 Ok(())
-            },
+            }
             Ok(_) => {
                 let err = anyhow::anyhow!("Unexpected response to disconnect request");
                 warn!("{}", err);
                 Err(err)
-            },
+            }
             Err(e) => {
                 warn!("Error receiving disconnect acknowledgment: {}", e);
-                Err(anyhow::anyhow!("Error receiving disconnect acknowledgment: {}", e))
+                Err(anyhow::anyhow!(
+                    "Error receiving disconnect acknowledgment: {}",
+                    e
+                ))
             }
         }
-
     }
 
     /// Backup a file using an existing connection
-    async fn backup_file_with_existing_connection(&self, stream: &mut TlsStream<TcpStream>, file_path: &Path) -> Result<()> {
-        info!("Starting backup for file using existing connection: {}", file_path.display());
+    async fn backup_file_with_existing_connection(
+        &self,
+        stream: &mut TlsStream<TcpStream>,
+        file_path: &Path,
+    ) -> Result<()> {
+        info!(
+            "Starting backup for file using existing connection: {}",
+            file_path.display()
+        );
 
         // Read the file and get metadata
         let file_content = tokio::fs::read(file_path).await?;
@@ -411,10 +417,10 @@ impl BackupClient {
                 negotiated_chunk_size,
             } => {
                 info!(
-                "Server ready to receive file '{}' with chunk size: {} bytes",
-                file_path.display(),
-                negotiated_chunk_size
-            );
+                    "Server ready to receive file '{}' with chunk size: {} bytes",
+                    file_path.display(),
+                    negotiated_chunk_size
+                );
                 negotiated_chunk_size
             }
             ServerResponse::Error(msg) => {
@@ -451,22 +457,25 @@ impl BackupClient {
                 } => {
                     if resp_offset != offset {
                         return Err(anyhow::anyhow!(
-                        "Server acknowledged wrong chunk offset: {} (expected {})",
-                        resp_offset,
-                        offset
-                    ));
+                            "Server acknowledged wrong chunk offset: {} (expected {})",
+                            resp_offset,
+                            offset
+                        ));
                     }
 
                     if !verified {
                         return Err(anyhow::anyhow!(
-                        "Chunk verification failed at offset {}",
-                        offset
-                    ));
+                            "Chunk verification failed at offset {}",
+                            offset
+                        ));
                     }
 
                     // Log only occasionally for large files
                     if chunks_count % 20 == 0 || chunks_count == 0 {
-                        info!("Chunk {} at offset {} verified successfully", chunks_count, offset);
+                        info!(
+                            "Chunk {} at offset {} verified successfully",
+                            chunks_count, offset
+                        );
                     }
                 }
                 ServerResponse::Error(msg) => {
@@ -481,7 +490,10 @@ impl BackupClient {
         }
 
         // Send completion message
-        info!("All chunks sent for file '{}', sending completion message", file_path.display());
+        info!(
+            "All chunks sent for file '{}', sending completion message",
+            file_path.display()
+        );
         let complete_message = BackupMessage::Complete {
             hash: file_hash,
             chunks_count,
@@ -494,14 +506,27 @@ impl BackupClient {
         match response {
             ServerResponse::BackupComplete { verified } => {
                 if verified {
-                    info!("File '{}' backup completed and verified successfully", file_path.display());
+                    info!(
+                        "File '{}' backup completed and verified successfully",
+                        file_path.display()
+                    );
                     Ok(())
                 } else {
-                    Err(anyhow::anyhow!("File '{}' backup completed but verification failed", file_path.display()))
+                    Err(anyhow::anyhow!(
+                        "File '{}' backup completed but verification failed",
+                        file_path.display()
+                    ))
                 }
             }
-            ServerResponse::Error(msg) => Err(anyhow::anyhow!("Server error for file '{}': {}", file_path.display(), msg)),
-            _ => Err(anyhow::anyhow!("Unexpected server response for file '{}'", file_path.display())),
+            ServerResponse::Error(msg) => Err(anyhow::anyhow!(
+                "Server error for file '{}': {}",
+                file_path.display(),
+                msg
+            )),
+            _ => Err(anyhow::anyhow!(
+                "Unexpected server response for file '{}'",
+                file_path.display()
+            )),
         }
     }
 
@@ -512,8 +537,8 @@ impl BackupClient {
         include_subdirectories: bool,
         file_pattern: Option<&str>,
     ) -> Result<Vec<PathBuf>> {
-        use walkdir::WalkDir;
         use regex::Regex;
+        use walkdir::WalkDir;
 
         let mut files = Vec::new();
 
@@ -568,10 +593,10 @@ impl Application for BackupClient {
     type Message = Message;
     type Theme = Theme;
     type Flags = ();
-    
+
     fn new(_flags: Self::Flags) -> (Self, iced::Command<Message>) {
         let client = BackupClient::new(String::from("localhost"), 3000);
-        
+
         // Load settings on startup
         (
             client,
@@ -587,27 +612,32 @@ impl Application for BackupClient {
             ),
         )
     }
-    
+
     fn title(&self) -> String {
         String::from("Llamapak: Fast, light, no stragglers.")
     }
-    
+
     fn update(&mut self, message: Message) -> iced::Command<Message> {
         match message {
             Message::SetBackupPath(path) => {
                 self.backup_path = path.clone();
                 // Update or add to backup_paths in settings
-                if let Some(_) = self.settings.backup_paths.iter_mut().find(|e| e.path == path) {
-                    // Path already exists in list
+                if let Some(_) = self
+                    .settings
+                    .backup_paths
+                    .iter_mut()
+                    .find(|e| e.path == path)
+                {
+                    self.status = "Backup path already exists".to_string();
                 } else {
-                    // Add as new backup path
                     self.settings.backup_paths.push(BackupPathEntry {
                         path,
                         is_directory: false,
-                        include_subdirectories: true,  // Default to including subdirectories
-                        file_pattern: None,            // No file pattern by default
+                        include_subdirectories: true, // Default to including subdirectories
+                        file_pattern: None,           // No file pattern by default
                         last_backup_time: None,
                     });
+                    self.status = "Backup path added".to_string();
                 }
 
                 iced::Command::none()
@@ -620,14 +650,16 @@ impl Application for BackupClient {
                 }
 
                 self.status = "Initializing backup...".to_string();
-                self.is_running = true;  // Add this line
+                self.is_running = true; // Add this line
 
                 // Log this in settings
                 self.settings.add_log_entry(
                     "Backup".to_string(),
                     OperationStatus::InProgress,
-                    format!("Starting backup with {} active paths",
-                            self.settings.backup_paths.iter().count())
+                    format!(
+                        "Starting backup with {} active paths",
+                        self.settings.backup_paths.iter().count()
+                    ),
                 );
 
                 let backup_paths = self.settings.backup_paths.clone();
@@ -641,15 +673,16 @@ impl Application for BackupClient {
                     let path = PathBuf::from(path_entry.path);
 
                     if path.is_dir() && path_entry.is_directory {
-                        let files_to_add = self.collect_files_from_directory(
-                            &path,
-                            path_entry.include_subdirectories,
-                            path_entry.file_pattern.as_deref())
+                        let files_to_add = self
+                            .collect_files_from_directory(
+                                &path,
+                                path_entry.include_subdirectories,
+                                path_entry.file_pattern.as_deref(),
+                            )
                             .expect("Unable to extract a file list.");
 
                         backup_op_paths.extend(files_to_add)
-                    }
-                    else {
+                    } else {
                         backup_op_paths.extend(Vec::from([path]));
                     }
                 }
@@ -658,8 +691,15 @@ impl Application for BackupClient {
                     async move {
                         let mut errors = Vec::new();
 
-                        match start_backup_async(backup_op_paths.clone(), server_address.clone(), settings.clone(), encryption_key).await {
-                            Ok(_) => {},
+                        match start_backup_async(
+                            backup_op_paths.clone(),
+                            server_address.clone(),
+                            settings.clone(),
+                            encryption_key,
+                        )
+                        .await
+                        {
+                            Ok(_) => {}
                             Err(e) => errors.push(format!("Errors backing up: {}", e)),
                         }
                         if errors.is_empty() {
@@ -671,24 +711,24 @@ impl Application for BackupClient {
                     |result| match result {
                         Ok(()) => Message::BackupInitiated(Ok(())),
                         Err(e) => Message::BackupInitiated(Err(e.to_string())),
-                    }
+                    },
                 )
             }
             Message::StopBackup => {
                 self.is_running = false;
                 self.status = "Backup was stopped".to_string();
-                
+
                 // Log this in settings
                 self.settings.add_log_entry(
                     "Backup".to_string(),
                     OperationStatus::Failure,
-                    "Backup was manually stopped".to_string()
+                    "Backup was manually stopped".to_string(),
                 );
-                
+
                 // Create a copy of the necessary data
                 let settings_copy = self.settings.clone();
                 let encryption_key = self.encryption_key;
-                
+
                 Command::perform(
                     async move {
                         let settings_path = ClientSettings::default_local_path();
@@ -709,14 +749,14 @@ impl Application for BackupClient {
                     self.status = format!("Invalid port number: {}", self.new_server_port);
                     // Maybe return early or set a flag
                 }
-                
+
                 // Save updated settings
                 self.show_settings = false; // Close settings panel
-                
+
                 // Create a copy of the necessary data
                 let settings_copy = self.settings.clone();
                 let encryption_key = self.encryption_key;
-                
+
                 Command::perform(
                     async move {
                         let settings_path = ClientSettings::default_local_path();
@@ -731,18 +771,18 @@ impl Application for BackupClient {
             Message::BackupFailed(error) => {
                 self.is_running = false;
                 self.status = format!("Backup failed: {}", error);
-                
+
                 // Log this in settings
                 self.settings.add_log_entry(
                     "Backup".to_string(),
                     OperationStatus::Failure,
-                    format!("Backup failed: {}", error)
+                    format!("Backup failed: {}", error),
                 );
-                
+
                 // Create a copy of the necessary data
                 let settings_copy = self.settings.clone();
                 let encryption_key = self.encryption_key;
-                
+
                 Command::perform(
                     async move {
                         let settings_path = ClientSettings::default_local_path();
@@ -759,31 +799,31 @@ impl Application for BackupClient {
                     Ok(_) => {
                         self.is_running = false;
                         self.status = "Backup completed".to_string();
-                        
+
                         // Log successful backup in settings
                         self.settings.add_log_entry(
                             "Backup".to_string(),
                             OperationStatus::Success,
-                            format!("Backup of {} completed successfully", self.backup_path)
+                            format!("Backup of {} completed successfully", self.backup_path),
                         );
                     }
                     Err(error) => {
                         self.is_running = false;
                         self.status = format!("Backup failed: {}", error);
-                        
+
                         // Log failed backup in settings
                         self.settings.add_log_entry(
                             "Backup".to_string(),
                             OperationStatus::Failure,
-                            format!("Backup failed: {}", error)
+                            format!("Backup failed: {}", error),
                         );
                     }
                 }
-                
+
                 // Create a copy of the necessary data
                 let settings_copy = self.settings.clone();
                 let encryption_key = self.encryption_key;
-                
+
                 Command::perform(
                     async move {
                         let settings_path = ClientSettings::default_local_path();
@@ -797,25 +837,25 @@ impl Application for BackupClient {
             }
             Message::SyncSettings => {
                 self.status = "Syncing settings with server...".to_string();
-                
+
                 // Create copies of the needed data
                 let mut settings_copy = self.settings.clone();
                 let encryption_key = self.encryption_key;
                 let server_ip = self.settings.server_ip.clone();
                 let server_port = self.settings.server_port;
-                
+
                 Command::perform(
                     async move {
                         // First sync the settings with server
                         settings_copy.sync_with_server(
                             &format!("{}:{}", server_ip, server_port),
-                            &encryption_key
+                            &encryption_key,
                         )?;
-                    
+
                         // Then save the updated settings
                         let settings_path = ClientSettings::default_local_path();
                         settings_copy.save(&settings_path, &encryption_key)?;
-                        
+
                         Ok::<(), anyhow::Error>(())
                     },
                     |result| match result {
@@ -845,9 +885,7 @@ impl Application for BackupClient {
                 self.settings.log_level = level;
                 iced::Command::none()
             }
-            Message::Quit => {
-                iced::Command::none()
-            }
+            Message::Quit => iced::Command::none(),
             Message::ConnectionError(error) => {
                 self.status = format!("Connection error: {}", error);
                 iced::Command::none()
@@ -861,12 +899,12 @@ impl Application for BackupClient {
                     Err(error) => {
                         self.is_running = false;
                         self.status = format!("Backup failed: {}", error);
-                        
+
                         // Log this in settings
                         self.settings.add_log_entry(
                             "Backup".to_string(),
                             OperationStatus::Failure,
-                            format!("Backup initiation failed: {}", error)
+                            format!("Backup initiation failed: {}", error),
                         );
                     }
                 }
@@ -920,7 +958,12 @@ impl Application for BackupClient {
                 let test_path = String::from("./backups/");
 
                 // Add to backup paths if not already present
-                if !self.settings.backup_paths.iter().any(|e| e.path == test_path) {
+                if !self
+                    .settings
+                    .backup_paths
+                    .iter()
+                    .any(|e| e.path == test_path)
+                {
                     self.settings.backup_paths.push(BackupPathEntry {
                         path: test_path.clone(),
                         is_directory: true,
@@ -938,7 +981,15 @@ impl Application for BackupClient {
                 Command::none()
             }
             Message::SelectBackupPathType(is_directory) => {
+                debug!(
+                    "SelectBackupPathType: is_directory_backup={}",
+                    self.is_directory_backup
+                );
                 self.is_directory_backup = is_directory;
+                debug!(
+                    "SelectBackupPathType: is_directory_backup={}",
+                    self.is_directory_backup
+                );
                 Command::none()
             }
             Message::SetBackupPathIncludeSubdirs(include) => {
@@ -987,104 +1038,138 @@ impl Application for BackupClient {
             }
         }
     }
-    
+
     fn view(&self) -> Element<Message> {
+        let header_background_color;
+
+        if self.settings.dark_mode {
+            // Dark mode
+            header_background_color = iced::Color::from_rgb8(13, 22, 38);
+        } else {
+            // Light mode
+            header_background_color = iced::Color::from_rgb8(0, 119, 182);
+        }
+
         if self.show_settings {
             // Settings view
+            let header_height = Length::FillPortion(2);
+            let content_height = Length::FillPortion(9);
+
+            let settings_header = container(
+                row![
+                    // Left side with text
+                    text("Client Settings").size(24),
+                    // Spacer that pushes the buttons to the right
+                    container(row![]).width(Length::Fill),
+                    // Right side with theme toggle
+                    iced::widget::toggler("Dark Mode".to_string(), self.settings.dark_mode, |_| {
+                        Message::ToggleDarkMode
+                    })
+                    .size(16)
+                    .width(Length::Fill)
+                ]
+                .padding(10)
+                .width(Length::Fill)
+                .height(header_height),
+            )
+            .style(iced::widget::container::Appearance {
+                text_color: None,
+                background: Some(iced::Background::Color(header_background_color)),
+                border: Default::default(),
+                shadow: Default::default(),
+            });
+
             let settings_form = iced::widget::scrollable(
                 column![
-                text("Client Settings")
-                    .size(24),
-                
-                // Backup Paths section
-                text("Backup Paths:").size(18),
-                
-                // List of current backup paths
-                self.view_backup_paths(),
-                
-                // Add new backup path form
-                text("Add New Backup Path").size(16),
-                row![
-                    text_input("Enter file path...", &self.new_backup_path)
-                        .on_input(Message::SetNewBackupPath)
-                        .width(Length::FillPortion(5)),
-                    button(text("Browse..."))
-                        .on_press(Message::BrowseForBackupFile)
-                        .width(Length::FillPortion(1)),
-                ].spacing(10),
-                
-                // Backup type controls
-                row![
-                    text("Type:").size(16),
-                    button(
-                        text(if self.is_directory_backup { "Directory" } else { "File" })
-                    ).on_press(Message::SelectBackupPathType(!self.is_directory_backup)),
-                ].spacing(10),
-                
-                // Subdirectory controls (only visible for directory backups)
-                if self.is_directory_backup {
+                    // Backup Paths section
+                    horizontal_rule(1),
+                    text("Backup Targets:").size(18),
+                    self.view_backup_paths(),
+                    // Add new backup path form
+                    text("Add New Backup Path").size(16),
                     row![
-                        text("Include Subdirectories:").size(16),
-                        button(
-                            text(if self.include_subdirectories { "Yes" } else { "No" })
-                        ).on_press(Message::SetBackupPathIncludeSubdirs(!self.include_subdirectories)),
-                    ].spacing(10)
-                } else {
-                    row![Container::new(Space::new(Length::Fill, Length::Fill))]
-                        
-                },
-                
-                // File pattern control (only visible for directory backups)
-                if self.is_directory_backup {
+                        text_input("Enter file path...", &self.new_backup_path)
+                            .on_input(Message::SetNewBackupPath)
+                            .width(Length::FillPortion(7)),
+                        button(text("Browse..."))
+                            .on_press(Message::BrowseForBackupFile)
+                            .width(Length::FillPortion(1)),
+                    ]
+                    .spacing(10),
+                    // Backup type controls
                     row![
-                        text("File Pattern:").size(16),
-                        text_input("e.g., *.txt,*.md", &self.file_pattern)
-                            .on_input(Message::SetBackupPathPattern)
-                            .width(Length::Fill),
-                    ].spacing(10)
-                } else {
-                    row![].spacing(0) // Empty row instead of container
-                },
-
-    
-                // Add button
-                button(text("Add Backup Path"))
-                    .on_press(Message::AddBackupPath)
-                    .width(Length::Fill),
-                
-                // Separator
-                horizontal_rule(1),
-
-                        
-                // Server settings
-                text("Server IP:").size(16),
-                text_input("127.0.0.1", &self.new_server_ip)
-                    .on_input(Message::SetServerIP),
-                
-                text("Server Port:").size(16),
-                text_input("3000", &self.new_server_port)
-                    .on_input(Message::SetServerPort),
-                
-                // Theme settings
-                row![
-                    iced::widget::toggler("Dark Mode".to_string(), self.settings.dark_mode, |_| Message::ToggleDarkMode)
+                        text("Type:").size(16),
+                        button(text(if self.is_directory_backup {
+                            "Directory"
+                        } else {
+                            "File"
+                        }))
+                        .on_press(Message::SelectBackupPathType(!self.is_directory_backup))
+                        .width(Length::from(100)),
+                    ]
+                    .spacing(10),
+                    // Subdirectory controls (only visible for directory backups)
+                    if self.is_directory_backup {
+                        row![iced::widget::toggler(
+                            "Include Subdirectories".to_string(),
+                            self.include_subdirectories,
+                            |_| Message::SetBackupPathIncludeSubdirs(!self.include_subdirectories)
+                        )
                         .size(16)
-                        .width(Length::Fill),
-                    ].spacing(10),
-                
-                // Save and cancel buttons
-                row![
-                    button(text("Save Settings")).on_press(Message::SaveSettings),
-                    button(text("Sync with Server")).on_press(Message::SyncSettings),
-                ].spacing(10),
-                
-                // Status message
-                text(&self.status).size(16),
-                ].spacing(20).padding(20)
-            ).height(Length::Fill);
+                        .width(Length::Fill),]
+                        .spacing(10)
+                    } else {
+                        row![Container::new(Space::new(Length::Fill, Length::Fill))]
+                    },
+                    // File pattern control (only visible for directory backups)
+                    if self.is_directory_backup {
+                        row![
+                            text("File Pattern:").size(16),
+                            text_input("e.g., *.txt,*.md", &self.file_pattern)
+                                .on_input(Message::SetBackupPathPattern)
+                                .width(Length::Fill),
+                            button(text("Add Backup Path"))
+                                .on_press(Message::AddBackupPath)
+                                .width(Length::Fill),
+                        ]
+                        .spacing(10)
+                    } else {
+                        row![button(text("Add Backup Path"))
+                            .on_press(Message::AddBackupPath)
+                            .width(Length::Fill),]
+                        .spacing(0) // Empty row instead of container
+                    },
+                    // Server settings
+                    horizontal_rule(1),
+                    row![
+                        text("Server:").size(16),
+                        text_input("127.0.0.1", &self.new_server_ip)
+                            .size(14)
+                            .on_input(Message::SetServerIP)
+                            .width(Length::from(300)),
+                        text("Port:").size(16),
+                        text_input("3000", &self.new_server_port)
+                            .size(14)
+                            .on_input(Message::SetServerPort)
+                            .width(Length::from(100))
+                    ]
+                    .spacing(10),
+                    // Save and cancel buttons
+                    horizontal_rule(1),
+                    row![
+                        button(text("Save Settings")).on_press(Message::SaveSettings),
+                        button(text("Sync with Server")).on_press(Message::SyncSettings),
+                    ]
+                    .spacing(10),
+                    // Status message
+                    text(&self.status).size(16),
+                ]
+                .spacing(20)
+                .padding(20),
+            )
+            .height(content_height);
 
-            
-            container(settings_form)
+            container(column![settings_header, settings_form])
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .center_x()
@@ -1094,35 +1179,43 @@ impl Application for BackupClient {
             // Main application view
             let header_height = Length::FillPortion(2);
             let content_height = Length::FillPortion(9);
-            
+
             // Top row (header)
-            let header = row![
-                // Left side with text
-                text("Llamapak").size(24),
-                // Spacer that pushes the buttons to the right
-                container(row![]) // Empty container
-                    .width(Length::Fill),
-                // Right side with buttons
+            let header = container(
                 row![
-                    button(text(if self.is_running { "Stop" } else { "Start" })).on_press(
-                        if self.is_running {
-                            Message::StopBackup
-                        } else {
-                            Message::StartBackup
-                        }
-                    ),
-                    button(text("Settings")).on_press(Message::OpenSettings),
+                    // Left side with text
+                    text("Llamapak").size(24),
+                    // Spacer that pushes the buttons to the right
+                    container(row![]).width(Length::Fill),
+                    // Right side with buttons
+                    row![
+                        button(text(if self.is_running { "Stop" } else { "Start" })).on_press(
+                            if self.is_running {
+                                Message::StopBackup
+                            } else {
+                                Message::StartBackup
+                            }
+                        ),
+                        button(text("Settings")).on_press(Message::OpenSettings),
+                    ]
+                    .spacing(10)
                 ]
-                .spacing(10)
-            ]
-            .padding(10)
-            .width(Length::Fill)
-            .height(header_height);
-    
+                .padding(10)
+                .width(Length::Fill)
+                .height(header_height),
+            )
+            .style(iced::widget::container::Appearance {
+                text_color: None,
+                background: Some(iced::Background::Color(header_background_color)),
+                border: Default::default(),
+                shadow: Default::default(),
+            });
+
             // Recent operations from settings
             let operations_list = if !self.settings.recent_operations.is_empty() {
                 column(
-                    self.settings.recent_operations
+                    self.settings
+                        .recent_operations
                         .iter()
                         .take(5)
                         .map(|entry| {
@@ -1131,18 +1224,16 @@ impl Application for BackupClient {
                                 OperationStatus::Failure => "Failed",
                                 OperationStatus::InProgress => "In Progress",
                             };
-                            
+
                             // Use unwrap_or_else for better error handling
-                            let formatted_time = chrono::DateTime::from_timestamp(entry.timestamp as i64, 0)
-                                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                                .unwrap_or_else(|| "Unknown time".to_string());
-                            
+                            let formatted_time =
+                                chrono::DateTime::from_timestamp(entry.timestamp as i64, 0)
+                                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                                    .unwrap_or_else(|| "Unknown time".to_string());
+
                             text(format!(
                                 "{}: {} - {} - {}",
-                                formatted_time,
-                                entry.operation,
-                                status_text,
-                                entry.details
+                                formatted_time, entry.operation, status_text, entry.details
                             ))
                             .size(16)
                             .into()
@@ -1170,7 +1261,7 @@ impl Application for BackupClient {
                 .spacing(5)
                 .width(Length::Fill)
             };
-    
+
             // Main content
             let content = column![
                 // Second row
@@ -1198,7 +1289,7 @@ impl Application for BackupClient {
             .padding(10)
             .width(Length::Fill)
             .height(content_height);
-    
+
             // Combine all elements
             container(column![header, content])
                 .height(Length::Fill)
@@ -1206,15 +1297,40 @@ impl Application for BackupClient {
                 .into()
         }
     }
-    
+
     fn theme(&self) -> Theme {
         if self.settings.dark_mode {
             info!("Using Dark theme");
-            iced::Theme::Dark
-
+            Theme::Custom(
+                Box::new(iced::theme::Custom::new(
+                    String::from("Llamapak Dark"),
+                    iced::theme::Palette {
+                        background: Color::from_rgb8(19, 33, 68),
+                        text: Color::from_rgb8(230, 230, 230),
+                        primary: Color::from_rgb8(0, 119, 182),
+                        success: Color::from_rgb8(18, 102, 79),
+                        danger: Color::from_rgb8(174, 32, 18),
+                    },
+                ))
+                .into(),
+            )
+            //iced::Theme::Dark
         } else {
             info!("Using Light theme");
-            iced::Theme::Light
+            Theme::Custom(
+                Box::new(iced::theme::Custom::new(
+                    String::from("Llamapak Light"),
+                    iced::theme::Palette {
+                        background: Color::from_rgb8(237, 246, 249),
+                        text: Color::from_rgb8(0, 0, 0),
+                        primary: Color::from_rgb8(19, 33, 68),
+                        success: Color::from_rgb8(106, 153, 78),
+                        danger: Color::from_rgb8(195, 66, 63),
+                    },
+                ))
+                .into(),
+            )
+            // iced::Theme::Light
         }
     }
 }
@@ -1230,9 +1346,8 @@ async fn start_backup_async(
     file_paths: Vec<PathBuf>,
     server_addr: String,
     settings: ClientSettings,
-    encryption_key: [u8; 32]
+    encryption_key: [u8; 32],
 ) -> Result<(), anyhow::Error> {
-
     // Create a new client instance
     let mut client = BackupClient::new(server_addr, settings.server_port);
     client.settings = settings;
@@ -1254,9 +1369,9 @@ async fn start_backup_async(
     client.settings.add_log_entry(
         "Backup".to_string(),
         OperationStatus::Success,
-        format!("Completed backup of {:?} paths.", file_paths.len())
+        format!("Completed backup of {:?} paths.", file_paths.len()),
     );
-    
+
     // Save updated settings
     client.save_settings().await?;
 
@@ -1275,20 +1390,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_dir,
         log_file: String::from("llamapak-client.log"),
         max_files: 7,
-        log_level: tracing::Level::INFO,
+        log_level: tracing::Level::DEBUG,
         json_format: false,
     };
 
     initialize_logging(log_config).context("Failed to initialize logging")?;
     info!("Client application starting");
-    
+
     // Ensure settings directory exists
     if let Some(parent) = ClientSettings::default_local_path().parent() {
         std::fs::create_dir_all(parent).context("Failed to create settings directory")?;
     }
-    
+
     let mut settings = Settings::default();
-    settings.window.size = Size::new(800.0, 600.0);
+    settings.window.size = Size::new(900.0, 560.0);
     settings.window.position = Position::Centered;
 
     BackupClient::run(settings).map_err(|e| anyhow::anyhow!("GUI error: {}", e))?;

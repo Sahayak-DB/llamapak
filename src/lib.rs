@@ -1,6 +1,6 @@
+pub mod client_settings;
 pub mod logger;
 pub mod tls_client;
-pub mod client_settings;
 
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -63,12 +63,12 @@ where
     // Read message length
     let mut len_bytes = [0u8; 4];
     debug!("Waiting to read message length");
-    
+
     match stream.read_exact(&mut len_bytes).await {
         Ok(_) => {
             let len = u32::from_be_bytes(len_bytes);
             debug!("Received message length: {}", len);
-            
+
             // Read message data
             let mut buffer = vec![0u8; len as usize];
             stream
@@ -77,9 +77,10 @@ where
                 .context("Failed to read message data")?;
 
             // Deserialize response
-            let message: T = serde_json::from_slice(&buffer).context("Failed to deserialize message")?;
+            let message: T =
+                serde_json::from_slice(&buffer).context("Failed to deserialize message")?;
             Ok(message)
-        },
+        }
         Err(e) => {
             warn!("Failed to read message length: {}", e);
             Err(anyhow::anyhow!("Failed to read message length: {}", e))

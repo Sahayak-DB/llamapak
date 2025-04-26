@@ -1,16 +1,17 @@
 use anyhow::{Context, Result};
-use rcgen::{
-    Certificate, CertificateParams, DistinguishedName, DnType, SanType, PKCS_ECDSA_P256_SHA256,
-};
+use fs2::FileExt;
+use rcgen::{Certificate, CertificateParams, CertifiedKey, DistinguishedName, DnType, Ia5String, SanType, PKCS_ECDSA_P256_SHA256};
+use rustls::pki_types::PrivateKeyDer;
+use std::time::Duration;
 use std::fs::File;
 use std::io::Write;
 use std::io::{BufReader, Seek};
 use std::path::{Path, PathBuf};
+use serde::Serialize;
+use tempfile::tempfile_in;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
-use fs2::FileExt;
-use tempfile::tempfile_in;
 
 // Import from the library crate
 use llamapak::{
@@ -105,19 +106,12 @@ impl BackupServer {
         // Create storage directory if it doesn't exist
         if !storage_path.exists() {
             info!("Creating storage directory: {}", storage_path.display());
-            std::fs::create_dir_all(&storage_path)
-                .context("Failed to create storage directory")?;
+            std::fs::create_dir_all(&storage_path).context("Failed to create storage directory")?;
         }
-
 
         // Verify the storage directory is writable
-        match tempfile_in(&storage_path) {
-            Ok(_) => { /* Directory is writable */ }
-            Err(e) => {
-                return Err(anyhow::anyhow!("Storage directory {} is not writable: {}",
-                                  storage_path.display(), e));
-            }
-        }
+        let _ = tempfile_in(&storage_path)
+            .context(format!("Storage directory {} is not writable", storage_path.display()))?;
 
         // Use a file lock to prevent race conditions during certificate generation
         if !cert_path.exists() || !key_path.exists() {
@@ -131,9 +125,20 @@ impl BackupServer {
 
             if lock_file.try_lock_exclusive().is_ok() {
                 // We got the lock, generate certificates
-                generate_self_signed_cert(cert_path, key_path)
-                    .with_context(|| "Failed to generate self-signed certificate")?;
-                fs2::FileExt::unlock(&lock_file)?;
+                let result = generate_self_signed_cert(cert_path, key_path)
+                    .with_context(|| "Failed to generate self-signed certificate");
+
+                // Always try to unlock and remove the lock file
+                let unlock_result = fs2::FileExt::unlock(&lock_file);
+                let _ = std::fs::remove_file(&lock_path);
+
+                // Now handle the original error if there was one
+                result?;
+
+                if let Err(e) = unlock_result {
+                    warn!("Failed to unlock certificate generation lock file: {}", e);
+                }
+
             } else {
                 // Wait for the process to generate a certificate
                 let mut attempt = 0;
@@ -149,30 +154,22 @@ impl BackupServer {
                         break;
                     }
 
-                    debug!("Waiting for certificates to be created... ({}/{})", attempt, max_attempts);
+                    debug!(
+                        "Waiting for certificates to be created... ({}/{})",
+                        attempt, max_attempts
+                    );
                 }
 
                 // Verify the certificates were actually created after waiting
                 if !cert_path.exists() || !key_path.exists() {
-                    return Err(anyhow::anyhow!("Certificates not created after waiting {} seconds", max_attempts));
+                    return Err(anyhow::anyhow!(
+                        "Certificates not created after waiting {} seconds",
+                        max_attempts
+                    ));
                 }
             }
 
             let _ = std::fs::remove_file(lock_path);
-        }
-
-        // Verify certificate and key files are readable before loading
-        if !cert_path.exists() {
-            return Err(anyhow::anyhow!(
-                "Certificate file does not exist at {}",
-                cert_path.display()
-            ));
-        }
-        if !key_path.exists() {
-            return Err(anyhow::anyhow!(
-                "Private key file does not exist at {}",
-                key_path.display()
-            ));
         }
 
         let certs = load_certs(cert_path)
@@ -182,11 +179,13 @@ impl BackupServer {
 
         // Check if there are any certificates
         if certs.is_empty() {
-            return Err(anyhow::anyhow!("No certificates found in {}", cert_path.display()));
+            return Err(anyhow::anyhow!(
+                "No certificates found in {}",
+                cert_path.display()
+            ));
         }
 
         let config = rustls::ServerConfig::builder()
-            .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .with_context(|| "Failed to create TLS server configuration")?;
@@ -242,9 +241,10 @@ impl BackupServer {
                 Ok(msg) => msg,
                 Err(e) => {
                     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                        if io_err.kind() == std::io::ErrorKind::UnexpectedEof || 
-                           io_err.kind() == std::io::ErrorKind::ConnectionReset ||
-                           io_err.kind() == std::io::ErrorKind::ConnectionAborted {
+                        if io_err.kind() == std::io::ErrorKind::UnexpectedEof
+                            || io_err.kind() == std::io::ErrorKind::ConnectionReset
+                            || io_err.kind() == std::io::ErrorKind::ConnectionAborted
+                        {
                             info!("Client disconnected unexpectedly");
                             break;
                         }
@@ -252,7 +252,7 @@ impl BackupServer {
                     return Err(e);
                 }
             };
-            
+
             match message {
                 BackupMessage::InitBackup(request) => {
                     let file_path = storage_path.join(&request.file_info.path);
@@ -281,7 +281,7 @@ impl BackupServer {
                         request.file_info.size,
                         negotiated_chunk_size,
                     );
-                    
+
                     // Process file chunks
                     loop {
                         let message = receive_message::<BackupMessage, _>(&mut stream).await?;
@@ -308,72 +308,73 @@ impl BackupServer {
                                     &mut stream,
                                     &ServerResponse::ChunkReceived { offset, verified },
                                 )
-                                    .await?;
+                                .await?;
                             }
-                            BackupMessage::Complete {
-                                hash,
-                                chunks_count
-                            } => {
-                                    // Verify the client-provided hash matches what we expect
-                                    if hash != session.file_operation.expected_hash {
-                                        warn!(
-                                            "File hash mismatch: client reported {}, but expected {}",
-                                            hash, session.file_operation.expected_hash
-                                        );
-                                        send_message(
-                                            &mut stream,
-                                            &ServerResponse::Error(format!(
-                                                "Hash mismatch: expected {}, got {}",
-                                                session.file_operation.expected_hash, hash
-                                            )),
-                                        ).await?;
-                                    }
+                            BackupMessage::Complete { hash, chunks_count } => {
+                                // Verify the client-provided hash matches what we expect
+                                if hash != session.file_operation.expected_hash {
+                                    warn!(
+                                        "File hash mismatch: client reported {}, but expected {}",
+                                        hash, session.file_operation.expected_hash
+                                    );
+                                    send_message(
+                                        &mut stream,
+                                        &ServerResponse::Error(format!(
+                                            "Hash mismatch: expected {}, got {}",
+                                            session.file_operation.expected_hash, hash
+                                        )),
+                                    )
+                                    .await?;
+                                }
 
-                                    if session.file_operation.chunks.len() as u64 != chunks_count {
-                                        warn!(
+                                if session.file_operation.chunks.len() as u64 != chunks_count {
+                                    warn!(
                                             "Chunks count mismatch: client reported {} chunks, but server received {}",
                                             chunks_count,
                                             session.file_operation.chunks.len()
                                         );
-                                        send_message(
-                                            &mut stream,
-                                            &ServerResponse::Error(format!(
-                                                "Expected {} chunks, got {}",
-                                                chunks_count,
-                                                session.file_operation.chunks.len()
-                                            )),
-                                        )
-                                            .await?;
-                                        break;
-                                    }
-                                    match session.save_file().await {
-                                        Ok(verified) => {
-                                            if verified {
-                                                info!(
+                                    send_message(
+                                        &mut stream,
+                                        &ServerResponse::Error(format!(
+                                            "Expected {} chunks, got {}",
+                                            chunks_count,
+                                            session.file_operation.chunks.len()
+                                        )),
+                                    )
+                                    .await?;
+                                    break;
+                                }
+                                match session.save_file().await {
+                                    Ok(verified) => {
+                                        if verified {
+                                            info!(
                                                     "Backup completed successfully: file hash verified for '{}'",
                                                     session.file_operation.file_path.display()
                                                 );
-                                            } else {
-                                                warn!(
-                                                    "Backup hash verification failed for '{}'",
-                                                    session.file_operation.file_path.display()
-                                                );
-                                            }
-                                            send_message(
-                                                &mut stream,
-                                                &ServerResponse::BackupComplete { verified },
-                                            )
-                                                .await?;
+                                        } else {
+                                            warn!(
+                                                "Backup hash verification failed for '{}'",
+                                                session.file_operation.file_path.display()
+                                            );
                                         }
-                                        Err(e) => {
-                                            error!("Failed to save file: {}", e);
-                                            send_message(
-                                                &mut stream,
-                                                &ServerResponse::Error(format!("Failed to save file: {}", e)),
-                                            )
-                                                .await?;
-                                        }
+                                        send_message(
+                                            &mut stream,
+                                            &ServerResponse::BackupComplete { verified },
+                                        )
+                                        .await?;
                                     }
+                                    Err(e) => {
+                                        error!("Failed to save file: {}", e);
+                                        send_message(
+                                            &mut stream,
+                                            &ServerResponse::Error(format!(
+                                                "Failed to save file: {}",
+                                                e
+                                            )),
+                                        )
+                                        .await?;
+                                    }
+                                }
                                 break;
                             }
                             BackupMessage::Disconnect { reason } => {
@@ -475,7 +476,7 @@ async fn main() -> Result<()> {
 }
 
 // Helper functions for loading TLS certificates
-fn load_certs(path: &Path) -> Result<Vec<rustls::Certificate>> {
+fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let cert_file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open certificate file: {}", path.display()))?;
     let mut reader = BufReader::new(cert_file);
@@ -484,13 +485,13 @@ fn load_certs(path: &Path) -> Result<Vec<rustls::Certificate>> {
     let certs = rustls_pemfile::certs(&mut reader)
         .collect::<std::io::Result<Vec<_>>>()? // First collect IO errors
         .into_iter()
-        .map(|v| rustls::Certificate(v.into_owned().to_vec()))
+        .map(|v| v.to_owned())
         .collect();
 
     Ok(certs)
 }
 
-fn load_private_key(path: &Path) -> Result<rustls::PrivateKey> {
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     // Open key file
     let key_file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open private key file: {}", path.display()))?;
@@ -502,9 +503,8 @@ fn load_private_key(path: &Path) -> Result<rustls::PrivateKey> {
         .context("Failed to parse PKCS8 private keys")?;
 
     if !pkcs8_keys.is_empty() {
-        // Get the bytes from the PKCS8 key
-        let key_data = pkcs8_keys[0].secret_pkcs8_der();
-        return Ok(rustls::PrivateKey(key_data.to_vec()));
+        // Convert to PrivateKeyDer
+        return Ok(pkcs8_keys[0].clone_key().into());
     }
 
     // If no PKCS8 keys found, rewind the reader and try RSA keys
@@ -523,9 +523,8 @@ fn load_private_key(path: &Path) -> Result<rustls::PrivateKey> {
         ));
     }
 
-    // Get the bytes from the RSA key
-    let key_data = rsa_keys[0].secret_pkcs1_der();
-    Ok(rustls::PrivateKey(key_data.to_vec()))
+    // Return the RSA key
+    Ok(rsa_keys[0].clone_key().into())
 }
 
 fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()> {
@@ -544,7 +543,6 @@ fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()> {
 
     // Configure certificate parameters
     let mut params = CertificateParams::default();
-    params.alg = &PKCS_ECDSA_P256_SHA256;
 
     // Set the distinguished name
     let mut distinguished_name = DistinguishedName::new();
@@ -554,18 +552,25 @@ fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()> {
     params.distinguished_name = distinguished_name;
 
     // Set subject alternative names
-    params.subject_alt_names = vec![
-        SanType::DnsName("localhost".to_string()),
-        SanType::IpAddress("127.0.0.1".to_string().parse()?),
-    ];
+    params.subject_alt_names.push(SanType::DnsName("localhost".to_string().parse()?));
+    params.subject_alt_names.push(SanType::IpAddress("127.0.0.1".parse()?));
 
-    // Generate the certificate
-    let cert = Certificate::from_params(params).context("Failed to generate certificate")?;
+    // Set expiration
+    params.not_before = std::time::SystemTime::now().into();
+    params.not_after = std::time::SystemTime::now()
+        .checked_add(std::time::Duration::from_secs(365 * 24 * 60 * 60))
+        .unwrap()
+        .into();
+
+    // Generate key and certificate
+    let key_pair = rcgen::KeyPair::generate()?;
+    let certified_key = params.self_signed(&key_pair)?;
+
+    
+    let key_pem = key_pair.serialize_pem();
+    let cert_pem = certified_key.pem();
 
     // Write the certificate to file
-    let pem_cert = cert
-        .serialize_pem()
-        .context("Failed to serialize certificate to PEM")?;
     let mut cert_file = File::create(cert_path).with_context(|| {
         format!(
             "Failed to create certificate file at {}",
@@ -573,15 +578,14 @@ fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()> {
         )
     })?;
     cert_file
-        .write_all(pem_cert.as_bytes())
+        .write_all(cert_pem.as_bytes())
         .context("Failed to write certificate to file")?;
 
     // Write the private key to file
-    let pem_key = cert.serialize_private_key_pem();
     let mut key_file = File::create(key_path)
         .with_context(|| format!("Failed to create key file at {}", key_path.display()))?;
     key_file
-        .write_all(pem_key.as_bytes())
+        .write_all(key_pem.as_bytes())
         .context("Failed to write private key to file")?;
 
     info!("Self-signed certificate and key generated successfully");

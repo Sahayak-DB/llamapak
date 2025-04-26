@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead, AeadCore};
-use rand::{rngs::OsRng, Rng};
+use chacha20poly1305::{aead::Aead, AeadCore, ChaCha20Poly1305, KeyInit};
+use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -62,7 +62,7 @@ pub enum LogLevel {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LogEntry {
-    pub timestamp: u64,  // Unix timestamp
+    pub timestamp: u64, // Unix timestamp
     pub operation: String,
     pub status: OperationStatus,
     pub details: String,
@@ -104,7 +104,7 @@ impl Default for ClientSettings {
             // Additional settings
             auto_update: true,
             default_download_path: "./downloads".to_string(),
-            upload_chunk_size: 1024 * 1024, // 1MB
+            upload_chunk_size: 1024 * 1024,   // 1MB
             download_chunk_size: 1024 * 1024, // 1MB
             max_concurrent_transfers: 3,
         }
@@ -135,8 +135,7 @@ impl ClientSettings {
 
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .context("Failed to create settings directory")?;
+            fs::create_dir_all(parent).context("Failed to create settings directory")?;
         }
 
         let mut file = File::create(path)
@@ -170,9 +169,9 @@ impl ClientSettings {
 
         // Trim if exceeds maximum
         if self.recent_operations.len() > MAX_LOG_ENTRIES {
-            self.recent_operations = self.recent_operations.split_off(
-                self.recent_operations.len() - MAX_LOG_ENTRIES
-            );
+            self.recent_operations = self
+                .recent_operations
+                .split_off(self.recent_operations.len() - MAX_LOG_ENTRIES);
         }
     }
 
@@ -180,38 +179,39 @@ impl ClientSettings {
     fn encrypt(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
         let cipher = ChaCha20Poly1305::new(key.into());
         let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let serialized = serde_json::to_vec(self)
-            .context("Failed to serialize settings")?;
-    
-    let encrypted = cipher.encrypt(&nonce, serialized.as_ref())
-        .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))?;
-    
-    // Combine nonce and encrypted data for storage
-    let mut result = Vec::with_capacity(nonce.len() + encrypted.len());
-    result.extend_from_slice(&nonce);
-    result.extend_from_slice(&encrypted);
-    Ok(result)
-}
+        let serialized = serde_json::to_vec(self).context("Failed to serialize settings")?;
+
+        let encrypted = cipher
+            .encrypt(&nonce, serialized.as_ref())
+            .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))?;
+
+        // Combine nonce and encrypted data for storage
+        let mut result = Vec::with_capacity(nonce.len() + encrypted.len());
+        result.extend_from_slice(&nonce);
+        result.extend_from_slice(&encrypted);
+        Ok(result)
+    }
 
     /// Decrypt and deserialize settings using ChaCha20Poly1305
     fn decrypt(encrypted_data: &[u8], key: &[u8; 32]) -> Result<Self> {
         if encrypted_data.len() < 12 {
             return Err(anyhow::anyhow!("Encrypted data too short"));
         }
-    
-    // Use the same initialization method as in encrypt for consistency
-    let cipher = ChaCha20Poly1305::new(key.into());
-    
-    // Split nonce and ciphertext
-    let nonce = chacha20poly1305::Nonce::from_slice(&encrypted_data[..12]);
-    let ciphertext = &encrypted_data[12..];
-    
-    let decrypted = cipher.decrypt(nonce, ciphertext)
-        .map_err(|e| anyhow::anyhow!("Decryption failed: {:?}", e))?;
-    
-    serde_json::from_slice(&decrypted)
-        .context("Failed to deserialize settings after decryption")
-}
+
+        // Use the same initialization method as in encrypt for consistency
+        let cipher = ChaCha20Poly1305::new(key.into());
+
+        // Split nonce and ciphertext
+        let nonce = chacha20poly1305::Nonce::from_slice(&encrypted_data[..12]);
+        let ciphertext = &encrypted_data[12..];
+
+        let decrypted = cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| anyhow::anyhow!("Decryption failed: {:?}", e))?;
+
+        serde_json::from_slice(&decrypted)
+            .context("Failed to deserialize settings after decryption")
+    }
 
     /// Synchronize settings with server
     pub fn sync_with_server(&mut self, _server_url: &str, encryption_key: &[u8; 32]) -> Result<()> {
@@ -264,7 +264,6 @@ impl ClientSettings {
             entry.last_backup_time = Some(timestamp);
         }
     }
-
 }
 
 #[cfg(test)]
