@@ -17,6 +17,7 @@ use llamapak::{
     receive_message, send_message, BackupMessage, BackupRequest, ChunkedFileOperation,
     ConnectionConfig, FileInfo, ServerResponse, DEFAULT_CHUNK_SIZE,
 };
+use llamapak::tls_client::TlsClient;
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -145,35 +146,47 @@ impl BackupClient {
         self.server_port = self.settings.server_port;
         self.new_server_ip = self.settings.server_ip.clone();
         self.new_server_port = self.settings.server_port.to_string();
-        
-        // Initialize TLS
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject,
-                ta.spki,
-                ta.name_constraints,
-            )
-        }));
 
-        let server_cert_from_file = tokio::fs::read("cert.pem").await?;
-        let server_cert = rustls_pemfile::certs(&mut server_cert_from_file.as_slice())
-            .collect::<Result<Vec<_>, _>>()?;
+        // Initialize TLS only if enabled in settings
+        if self.settings.tls_enabled {
+            // Ensure we have the server certificate
+            let cert_path = Path::new("cert.pem");
+            let cert_option = if cert_path.exists() {
+                Some(cert_path)
+            } else {
+                warn!("Server certificate not found at {}. Using system certificates only.", cert_path.display());
+                None
+            };
 
-        // Add the server certificate to the root store
-        for cert in server_cert {
-            root_store.add(&rustls::Certificate(cert.to_vec()))?;
+            // Create a TLS connector with the server's certificate
+            let connection_config = ConnectionConfig {
+                server_address: self.server_address.clone(),
+                server_port: self.server_port,
+            };
+
+            // Create and initialize TLS client
+            let mut tls_client = TlsClient::new(connection_config);
+
+            match tls_client.initialize(cert_option).await {
+                Ok(_) => {
+                    info!("TLS connection initialized successfully");
+                    // Add a getter method to TlsClient to access the connector
+                    self.connector = Some(tls_client.get_connector());
+                },
+                Err(e) => {
+                    warn!("Failed to initialize TLS connection: {}", e);
+                    return Err(anyhow::anyhow!("TLS initialization failed: {}", e));
+                }
+            }
+        } else {
+            info!("TLS is disabled in settings, connections will not be encrypted");
+            self.connector = None;
         }
 
-        let config = rustls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        self.connector = Some(TlsConnector::from(Arc::new(config)));
         Ok(())
     }
-    
+
+
     pub async fn load_settings(&mut self) -> Result<()> {
         let settings_path = ClientSettings::default_local_path();
         

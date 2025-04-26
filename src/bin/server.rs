@@ -101,16 +101,16 @@ impl BackupServer {
         key_path: &Path,
     ) -> Result<Self> {
         let storage_path = storage_path.into();
-        
+
         // Create a storage directory if it doesn't exist
         std::fs::create_dir_all(&storage_path)
             .with_context(|| format!("Failed to create storage directory at {}", storage_path.display()))?;
-        
+
         // Verify the storage directory is writable
         match tempfile_in(&storage_path) {
             Ok(_) => { /* Directory is writable */ }
             Err(e) => {
-                return Err(anyhow::anyhow!("Storage directory {} is not writable: {}", 
+                return Err(anyhow::anyhow!("Storage directory {} is not writable: {}",
                                   storage_path.display(), e));
             }
         }
@@ -119,7 +119,7 @@ impl BackupServer {
         if !cert_path.exists() || !key_path.exists() {
             warn!("Certificate or key file not found, generating self-signed certificate");
             warn!("For production use, it is recommended to use a properly signed certificate");
-            
+
             // Create a lock file
             let lock_path = cert_path.with_file_name(".cert_generation.lock");
             let lock_file = std::fs::File::create(&lock_path)
@@ -153,10 +153,10 @@ impl BackupServer {
                     return Err(anyhow::anyhow!("Certificates not created after waiting {} seconds", max_attempts));
                 }
             }
-            
+
             let _ = std::fs::remove_file(lock_path);
         }
-        
+
         // Verify certificate and key files are readable before loading
         if !cert_path.exists() {
             return Err(anyhow::anyhow!(
@@ -170,24 +170,24 @@ impl BackupServer {
                 key_path.display()
             ));
         }
-        
+
         let certs = load_certs(cert_path)
             .with_context(|| format!("Failed to load certificates from {}", cert_path.display()))?;
         let key = load_private_key(key_path)
             .with_context(|| format!("Failed to load private key from {}", key_path.display()))?;
-        
+
         // Check if there are any certificates
         if certs.is_empty() {
             return Err(anyhow::anyhow!("No certificates found in {}", cert_path.display()));
         }
-        
+
         let config = rustls::ServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .with_context(|| "Failed to create TLS server configuration")?;
         let acceptor = TlsAcceptor::from(std::sync::Arc::new(config));
-        
+
         Ok(Self {
             storage_path,
             acceptor,

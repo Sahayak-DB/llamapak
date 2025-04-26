@@ -18,22 +18,24 @@ use tracing::{debug, info, warn};
 /// A client for secure file operations over TLS
 pub struct TlsClient {
     connector: TlsConnector,
+    config: ClientConfig,
     connection_config: ConnectionConfig,
 }
 
 impl TlsClient {
     /// Create a new TLS client with the given configuration
     pub fn new(connection_config: ConnectionConfig) -> Self {
-        let connector = TlsConnector::from(Arc::new(
-            ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(RootCertStore::empty())
-                .with_no_client_auth(),
-        ));
-
+        let config = ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        
+        let connector = TlsConnector::from(Arc::new(config.clone()));
+        
         Self {
             connector,
             connection_config,
+            config,
         }
     }
     /// Initialize the TLS client with the required certificates
@@ -48,16 +50,33 @@ impl TlsClient {
                 ta.name_constraints,
             )
         }));
+        info!("Added system root certificates to trust store");
 
         // Add custom certificate if provided
         if let Some(path) = cert_path {
-            let server_cert = tokio::fs::read(path).await?;
-            let certs = rustls_pemfile::certs(&mut server_cert.as_slice())
-                .collect::<Result<Vec<_>, _>>()?;
-
-            for cert in certs {
-                root_store.add(&Certificate(cert.to_vec()))?;
+            info!("Loading custom certificate from path: {:?}", path);
+            match tokio::fs::read(path).await {
+                Ok(server_cert) => {
+                    let certs_result = rustls_pemfile::certs(&mut server_cert.as_slice())
+                        .collect::<Result<Vec<_>, _>>();
+                    
+                    match certs_result {
+                        Ok(certs) => {
+                            info!("Found {} certificates in provided cert file", certs.len());
+                            for (i, cert) in certs.iter().enumerate() {
+                                match root_store.add(&Certificate(cert.to_vec())) {
+                                    Ok(_) => info!("Successfully added certificate #{} to trust store", i+1),
+                                    Err(e) => warn!("Failed to add certificate #{} to trust store: {}", i+1, e),
+                                }
+                            }
+                        },
+                        Err(e) => warn!("Failed to parse certificates from file: {:?}", e),
+                    }
+                },
+                Err(e) => warn!("Failed to read certificate file: {:?}", e),
             }
+        } else {
+            info!("No custom certificate provided, using only system certificates");
         }
 
         let config = ClientConfig::builder()
@@ -66,6 +85,7 @@ impl TlsClient {
             .with_no_client_auth();
 
         self.connector = TlsConnector::from(Arc::new(config));
+        info!("TLS client initialized with configuration");
         Ok(())
     }
 
@@ -76,15 +96,49 @@ impl TlsClient {
             self.connection_config.server_address, self.connection_config.server_port
         );
 
-        info!("Connecting to server at {}", server_addr);
+        info!("Attempting to connect to server at {}", server_addr);
 
-        let stream = TcpStream::connect(&server_addr).await?;
-        let domain = ServerName::try_from(self.connection_config.server_address.as_str())?;
-
-        let tls_stream = self.connector.connect(domain, stream).await?;
-        info!("TLS connection established");
-
-        Ok(tls_stream)
+        match TcpStream::connect(&server_addr).await {
+            Ok(stream) => {
+                info!("TCP connection established to {}", server_addr);
+                
+                // Log the domain name we're using for validation
+                let domain_str = self.connection_config.server_address.as_str();
+                info!("Using server name '{}' for TLS validation", domain_str);
+                
+                match ServerName::try_from(domain_str) {
+                    Ok(domain) => {
+                        debug!("ServerName successfully parsed from '{}'", domain_str);
+                        
+                        match self.connector.connect(domain, stream).await {
+                            Ok(tls_stream) => {
+                                info!("TLS handshake successful with {}", server_addr);
+                                Ok(tls_stream)
+                            },
+                            Err(e) => {
+                                // Detailed error logging for TLS failure
+                                let error_details = format!("{:?}", e);
+                                warn!("TLS handshake failed: {}", error_details);
+                                if error_details.contains("BadCertificate") {
+                                    warn!("Certificate was rejected by peer (BadCertificate)");
+                                } else if error_details.contains("UnknownCA") {
+                                    warn!("Server certificate not trusted (UnknownCA)");
+                                }
+                                Err(anyhow::anyhow!("TLS connection failed: {}", e))
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to parse ServerName from '{}': {}", domain_str, e);
+                        Err(anyhow::anyhow!("Invalid server name for TLS: {}", e))
+                    }
+                }
+            },
+            Err(e) => {
+                warn!("TCP connection to {} failed: {}", server_addr, e);
+                Err(anyhow::anyhow!("Failed to connect to server: {}", e))
+            }
+        }
     }
     /// Send a file to the server
     pub async fn send_file(
@@ -244,6 +298,13 @@ impl TlsClient {
             )),
         }
     }
+    
+    /// Get the TLS connector
+    pub fn get_connector(&self) -> TlsConnector {
+        self.connector.clone()
+    }
+
+
 }
 
 // Convenience function to create and initialize a client with defaults
