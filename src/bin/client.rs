@@ -337,7 +337,7 @@ impl BackupClient {
         Ok(tls_stream)
     }
 
-    pub async fn start_backup(&self, paths: Vec<PathBuf>) -> Result<()> {
+    pub async fn start_backup(&self, paths: Vec<PathBuf>) -> Result<bool> {
         info!("Starting backup for {} paths", paths.len());
 
         // Reset the cancellation token before starting a new backup
@@ -360,7 +360,7 @@ impl BackupClient {
             if cancel_token.load(Ordering::SeqCst) {
                 info!("Backup operation cancelled");
                 // Optionally notify server about cancellation
-                return Ok(());
+                return Ok(false);
             }
 
             if path.is_dir() && self.is_directory_backup {
@@ -384,7 +384,7 @@ impl BackupClient {
                     // Check for cancellation before each file
                     if cancel_token.load(Ordering::SeqCst) {
                         info!("Backup operation cancelled during directory processing");
-                        return Ok(());
+                        return Ok(false);
                     }
 
                     // Backup the file
@@ -405,7 +405,7 @@ impl BackupClient {
         }
 
         info!("Backup completed successfully");
-        Ok(())
+        Ok(true)
 
     }
     /// Backup a file using an existing connection with cancellation support
@@ -920,8 +920,9 @@ impl Application for BackupClient {
                                     }
 
                                     match client.start_backup(backup_op_paths).await {
-                                        Ok(_) => Ok(true),  // Success
-                                        Err(e) => Err(e.to_string()), // Error during backup
+                                        Ok(true) => Ok(true),   // Successful completion
+                                        Ok(false) => Ok(false), // Cancelled
+                                        Err(e) => Err(e.to_string()),
                                     }
                                 },
                                 Err(e) => Err(e.to_string()), // Error setting up client
@@ -1023,9 +1024,10 @@ impl Application for BackupClient {
                 )
             }
             Message::BackupCompleted(result) => {
+                self.is_running = false;
+                
                 match result {
                     Ok(true) => {
-                        self.is_running = false;
                         self.status = "Backup completed".to_string();
 
                         // Log successful backup in settings
