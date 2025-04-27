@@ -150,7 +150,7 @@ impl BackupClient {
             .map(|(index, entry)| {
                 row![
                     // Path type icon (folder or file)
-                    text(if entry.is_directory { "📁" } else { "📄" }).size(16),
+                    text(if entry.is_directory { "D:" } else { "F:" }).size(16),
                     // Path details
                     column![
                         text(&entry.path).size(16),
@@ -186,7 +186,7 @@ impl BackupClient {
                     ]
                     .width(Length::Fill),
                     // Remove button
-                    button(text("❌"))
+                    button(text("Delete"))
                         .on_press(Message::RemoveBackupPath(index))
                         .style(iced::theme::Button::Destructive),
                 ]
@@ -1136,11 +1136,15 @@ impl Application for BackupClient {
                                 )
                                 .size(16),
                                 row![
-                                text("File Pattern:").size(16),
-                                text_input("e.g., *.txt,*.md", &self.file_pattern)
-                                    .on_input(Message::SetBackupPathPattern)
-                                    .width(Length::FillPortion(6)),].spacing(10)
-                            ].spacing(10).width(Length::FillPortion(7))
+                                    text("File Pattern:").size(16),
+                                    text_input("e.g., *.txt,*.md", &self.file_pattern)
+                                        .on_input(Message::SetBackupPathPattern)
+                                        .width(Length::FillPortion(6)),
+                                ]
+                                .spacing(10)
+                            ]
+                            .spacing(10)
+                            .width(Length::FillPortion(7))
                         ]
                         .spacing(10)
                     } else {
