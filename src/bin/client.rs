@@ -1,10 +1,14 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result};
-use iced::widget::{
-    button, column, container, horizontal_rule, row, text, text_input};
+use iced::alignment::Horizontal;
+use iced::widget::{button, column, container, horizontal_rule, horizontal_space, progress_bar, row, text, text_input, ProgressBar};
 use iced::window::Position;
+use iced::{Alignment, Background};
 use iced::{Application, Color, Command, Element, Length, Settings, Size, Theme};
+use iced_style::progress_bar::Appearance;
+use iced_style::theme;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -13,7 +17,38 @@ use tracing::{debug, error, info, warn};
 
 use llamapak::client_settings::BackupPathEntry;
 use llamapak::tls_client::TlsClient;
-use llamapak::{calculate_hash, client_settings::{ClientSettings, LogLevel, OperationStatus}, format_storage, logger::{initialize_logging, LoggerConfig}, receive_message, send_message, BackupMessage, BackupRequest, ChunkedFileOperation, ConnectionConfig, FileInfo, ServerResponse};
+use llamapak::{
+    calculate_hash,
+    client_settings::{ClientSettings, LogLevel, OperationStatus},
+    format_storage,
+    logger::{initialize_logging, LoggerConfig},
+    receive_message, send_message, BackupMessage, BackupRequest, ChunkedFileOperation,
+    ConnectionConfig, FileInfo, ServerResponse,
+};
+
+#[derive(Debug)]
+struct AtomicF32 {
+    inner: AtomicU32,
+}
+
+impl AtomicF32 {
+    fn new(value: f32) -> Self {
+        let bits = value.to_bits();
+        Self {
+            inner: AtomicU32::new(bits),
+        }
+    }
+
+    fn store(&self, value: f32, ordering: Ordering) {
+        let bits = value.to_bits();
+        self.inner.store(bits, ordering);
+    }
+
+    fn load(&self, ordering: Ordering) -> f32 {
+        let bits = self.inner.load(ordering);
+        f32::from_bits(bits)
+    }
+}
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -73,6 +108,7 @@ struct BackupClient {
     include_subdirectories: bool,
     file_pattern: String,
     cancel_token: Arc<AtomicBool>,
+    percent_complete: Arc<AtomicF32>,
 }
 
 impl BackupClient {
@@ -132,9 +168,12 @@ impl BackupClient {
             is_directory_backup: true, // Default to directory backup
             include_subdirectories: true,
             file_pattern: String::new(),
-            cancel_token: Arc::new(
-                std::sync::atomic::AtomicBool::new(false)),
+            cancel_token: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            percent_complete: Arc::new(AtomicF32::new(0.0)),
         }
+    }
+    pub fn get_percent_complete(&self) -> f32 {
+        self.percent_complete.load(Ordering::SeqCst)
     }
 
     fn view_backup_paths(&self) -> Element<Message> {
@@ -146,7 +185,6 @@ impl BackupClient {
             .map(|(index, entry)| {
                 row![
                     // Path type icon (folder or file)
-
                     text(if entry.is_directory { "D:" } else { "F:" }).size(16),
                     // Path details
                     column![
@@ -184,13 +222,12 @@ impl BackupClient {
                     ]
                     .width(Length::Fill),
                     // Remove button
-                    button(text("Delete"))
+                    button(text("Delete").horizontal_alignment(Horizontal::Center))
                         .on_press(Message::RemoveBackupPath(index))
                         .style(iced::theme::Button::Destructive),
                     text("").size(16),
                 ]
                 .spacing(10)
-
                 .width(Length::Fill)
                 .into()
             })
@@ -340,6 +377,9 @@ impl BackupClient {
     pub async fn start_backup(&self, paths: Vec<PathBuf>) -> Result<bool> {
         info!("Starting backup for {} paths", paths.len());
 
+        // Reset progress at the start
+        self.percent_complete.store(0.0, Ordering::SeqCst);
+
         // Reset the cancellation token before starting a new backup
         self.cancel_token.store(false, Ordering::SeqCst);
 
@@ -355,14 +395,9 @@ impl BackupClient {
             }
         };
 
-        for path in paths {
-            // Check if the backup has been cancelled
-            if cancel_token.load(Ordering::SeqCst) {
-                info!("Backup operation cancelled");
-                // Optionally notify server about cancellation
-                return Ok(false);
-            }
+        let mut all_files: Vec<PathBuf> = Vec::new();
 
+        for path in &paths {
             if path.is_dir() && self.is_directory_backup {
                 // Process directory backup
                 let pattern = if !self.file_pattern.is_empty() {
@@ -371,42 +406,54 @@ impl BackupClient {
                     None
                 };
 
-                let files = match self.collect_files_from_directory(&path, self.include_subdirectories, pattern) {
-                    Ok(files) => files,
+                match self.collect_files_from_directory(path, self.include_subdirectories, pattern)
+                {
+                    Ok(files) => all_files.extend(files),
                     Err(e) => {
-                        error!("Failed to collect files from directory {}: {}", path.display(), e);
+                        error!(
+                            "Failed to collect files from directory {}: {}",
+                            path.display(),
+                            e
+                        );
                         return Err(anyhow::anyhow!("Failed to collect files: {}", e));
                     }
                 };
-
-                // Process each file in the directory
-                for file_path in files {
-                    // Check for cancellation before each file
-                    if cancel_token.load(Ordering::SeqCst) {
-                        info!("Backup operation cancelled during directory processing");
-                        return Ok(false);
-                    }
-
-                    // Backup the file
-                    if let Err(e) = self.backup_file_with_cancellation(&mut stream, &file_path, &cancel_token).await {
-                        error!("Failed to backup file {}: {}", file_path.display(), e);
-                        return Err(e);
-                    }
-                }
             } else if path.is_file() {
-                // Backup a single file
-                if let Err(e) = self.backup_file_with_cancellation(&mut stream, &path, &cancel_token).await {
-                    error!("Failed to backup file {}: {}", path.display(), e);
-                    return Err(e);
-                }
-            } else {
-                warn!("Skipping non-existent path: {}", path.display());
+                all_files.push(path.clone());
             }
         }
 
-        info!("Backup completed successfully");
-        Ok(true)
+        let total_files = all_files.len();
+        if total_files == 0 {
+            self.percent_complete.store(100.0, Ordering::SeqCst);
+            return Ok(true);
+        }
 
+        for (file_index, file_path) in all_files.iter().enumerate() {
+            // Check if the backup has been cancelled
+            if cancel_token.load(Ordering::SeqCst) {
+                info!("Backup operation cancelled");
+                // Optionally notify server about cancellation
+                return Ok(false);
+            }
+
+            // Backup the file
+            if let Err(e) = self
+                .backup_file_with_cancellation(&mut stream, file_path, &cancel_token)
+                .await
+            {
+                error!("Failed to backup file {}: {}", file_path.display(), e);
+                return Err(e);
+            }
+
+            // Update progress after each file
+            let progress = ((file_index + 1) as f32 / total_files as f32) * 100.0;
+            self.percent_complete.store(progress, Ordering::SeqCst);
+        }
+
+        info!("Backup completed successfully");
+        self.percent_complete.store(100.0, Ordering::SeqCst);
+        Ok(true)
     }
     /// Backup a file using an existing connection with cancellation support
     async fn backup_file_with_cancellation(
@@ -421,9 +468,9 @@ impl BackupClient {
         }
 
         info!(
-        "Starting backup for file using existing connection: {}",
-        file_path.display()
-    );
+            "Starting backup for file using existing connection: {}",
+            file_path.display()
+        );
 
         // Read the file and get metadata
         let file_content = tokio::fs::read(file_path).await?;
@@ -456,10 +503,10 @@ impl BackupClient {
                 negotiated_chunk_size,
             } => {
                 info!(
-                "Server ready to receive file '{}' with chunk size: {} bytes",
-                file_path.display(),
-                negotiated_chunk_size
-            );
+                    "Server ready to receive file '{}' with chunk size: {} bytes",
+                    file_path.display(),
+                    negotiated_chunk_size
+                );
                 negotiated_chunk_size
             }
             ServerResponse::Error(msg) => {
@@ -476,7 +523,10 @@ impl BackupClient {
             // Check for cancellation before sending each chunk
             if cancel_token.load(Ordering::SeqCst) {
                 // Optionally notify server about cancellation
-                info!("Backup cancelled during file transfer: {}", file_path.display());
+                info!(
+                    "Backup cancelled during file transfer: {}",
+                    file_path.display()
+                );
                 return Ok(());
             }
 
@@ -503,25 +553,25 @@ impl BackupClient {
                 } => {
                     if resp_offset != offset {
                         return Err(anyhow::anyhow!(
-                        "Server acknowledged wrong chunk offset: {} (expected {})",
-                        resp_offset,
-                        offset
-                    ));
+                            "Server acknowledged wrong chunk offset: {} (expected {})",
+                            resp_offset,
+                            offset
+                        ));
                     }
 
                     if !verified {
                         return Err(anyhow::anyhow!(
-                        "Chunk verification failed at offset {}",
-                        offset
-                    ));
+                            "Chunk verification failed at offset {}",
+                            offset
+                        ));
                     }
 
                     // Log only occasionally for large files
                     if chunks_count % 20 == 0 || chunks_count == 0 {
                         info!(
-                        "Chunk {} at offset {} verified successfully",
-                        chunks_count, offset
-                    );
+                            "Chunk {} at offset {} verified successfully",
+                            chunks_count, offset
+                        );
                     }
                 }
                 ServerResponse::Error(msg) => {
@@ -537,15 +587,18 @@ impl BackupClient {
 
         // Check for cancellation before sending completion
         if cancel_token.load(Ordering::SeqCst) {
-            info!("Backup cancelled after sending all chunks: {}", file_path.display());
+            info!(
+                "Backup cancelled after sending all chunks: {}",
+                file_path.display()
+            );
             return Ok(());
         }
 
         // Send completion message
         info!(
-        "All chunks sent for file '{}', sending completion message",
-        file_path.display()
-    );
+            "All chunks sent for file '{}', sending completion message",
+            file_path.display()
+        );
         let complete_message = BackupMessage::Complete {
             hash: file_hash,
             chunks_count,
@@ -559,26 +612,26 @@ impl BackupClient {
             ServerResponse::BackupComplete { verified } => {
                 if verified {
                     info!(
-                    "File '{}' backup completed and verified successfully",
-                    file_path.display()
-                );
+                        "File '{}' backup completed and verified successfully",
+                        file_path.display()
+                    );
                     Ok(())
                 } else {
                     Err(anyhow::anyhow!(
-                    "File '{}' backup completed but verification failed",
-                    file_path.display()
-                ))
+                        "File '{}' backup completed but verification failed",
+                        file_path.display()
+                    ))
                 }
             }
             ServerResponse::Error(msg) => Err(anyhow::anyhow!(
-            "Server error for file '{}': {}",
-            file_path.display(),
-            msg
-        )),
+                "Server error for file '{}': {}",
+                file_path.display(),
+                msg
+            )),
             _ => Err(anyhow::anyhow!(
-            "Unexpected server response for file '{}'",
-            file_path.display()
-        )),
+                "Unexpected server response for file '{}'",
+                file_path.display()
+            )),
         }
     }
 
@@ -856,7 +909,7 @@ impl Application for BackupClient {
                         self.status = "Error: No backup paths specified".to_string();
                         return iced::Command::none();
                     }
-                    
+
                     self.is_running = true;
                     self.status = "Initializing backup...".to_string();
 
@@ -900,7 +953,7 @@ impl Application for BackupClient {
                             self.settings.backup_paths.iter().count()
                         ),
                     );
-                    
+
                     return Command::perform(
                         async move {
                             // Here we create a method that checks cancellation during the process
@@ -909,11 +962,12 @@ impl Application for BackupClient {
                                 server_port,
                                 settings.clone(),
                                 encryption_key,
-                                cancel_token.clone()
-                            ).await;
+                                cancel_token.clone(),
+                            )
+                            .await;
 
                             match client_result {
-                                Ok(mut client) => {
+                                Ok(client) => {
                                     // Now use the client to perform the backup
                                     if cancel_token.load(Ordering::SeqCst) {
                                         return Ok(false); // Cancelled before starting
@@ -924,7 +978,7 @@ impl Application for BackupClient {
                                         Ok(false) => Ok(false), // Cancelled
                                         Err(e) => Err(e.to_string()),
                                     }
-                                },
+                                }
                                 Err(e) => Err(e.to_string()), // Error setting up client
                             }
                         },
@@ -932,8 +986,8 @@ impl Application for BackupClient {
                             Ok(true) => Message::BackupCompleted(Ok(true)),
                             Ok(false) => Message::BackupCompleted(Ok(false)), // Cancelled
                             Err(msg) => Message::BackupFailed(msg),
-                        }
-                    )
+                        },
+                    );
                 }
                 iced::Command::none()
             }
@@ -1025,7 +1079,7 @@ impl Application for BackupClient {
             }
             Message::BackupCompleted(result) => {
                 self.is_running = false;
-                
+
                 match result {
                     Ok(true) => {
                         self.status = "Backup completed".to_string();
@@ -1044,7 +1098,7 @@ impl Application for BackupClient {
                         self.settings.add_log_entry(
                             "Backup".to_string(),
                             OperationStatus::Cancelled, // You may need to add this variant to your enum
-                            "Backup operation was cancelled by user".to_string()
+                            "Backup operation was cancelled by user".to_string(),
                         );
                     }
                     Err(error) => {
@@ -1283,81 +1337,121 @@ impl Application for BackupClient {
         let header_background_color;
         let header_border_bar;
         let status_border_bar;
+        let prog_bar_theme;
 
         if self.settings.dark_mode {
             // Dark mode
             header_background_color = iced::Color::from_rgb8(13, 22, 38);
-            header_border_bar = container(text("")
-                .size(1)).width(Length::Fill)
-                .style(container::Appearance {
-                    text_color: None,
-                    background: Some(iced::Background::Color(Color::from_rgb8(0, 119, 182))),
-                    border: Default::default(),
-                    shadow: Default::default(),
-                });
-            status_border_bar = container(text("")
-                .size(1)).width(Length::Fill)
-                .style(container::Appearance {
-                    text_color: None,
-                    background: Some(iced::Background::Color(Color::from_rgb8(0, 119, 182))),
-                    border: Default::default(),
-                    shadow: Default::default(),
-                });
+            header_border_bar =
+                container(text("").size(1))
+                    .width(Length::Fill)
+                    .style(container::Appearance {
+                        text_color: None,
+                        background: Some(iced::Background::Color(Color::from_rgb8(0, 119, 182))),
+                        border: Default::default(),
+                        shadow: Default::default(),
+                    });
+            status_border_bar =
+                container(text("").size(1))
+                    .width(Length::Fill)
+                    .style(container::Appearance {
+                        text_color: None,
+                        background: Some(iced::Background::Color(Color::from_rgb8(0, 119, 182))),
+                        border: Default::default(),
+                        shadow: Default::default(),
+                    });
+            prog_bar_theme = progress_bar::Appearance {
+                background: Background::Color([0.2, 0.2, 0.2].into()),
+                bar: Background::Color(Color::from_rgb8(13, 22, 38)),
+                border_radius: Default::default(),
+            };
         } else {
             // Light mode
             header_background_color = iced::Color::from_rgb8(0, 119, 182);
-            header_border_bar = container(text("")
-                .size(1)).width(Length::Fill)
-                .style(container::Appearance {
-                    text_color: None,
-                    background: Some(iced::Background::Color(Color::from_rgb8(13, 22, 38))),
-                    border: Default::default(),
-                    shadow: Default::default(),
-                });
-            status_border_bar = container(text("")
-                .size(1)).width(Length::Fill)
-                .style(container::Appearance {
-                    text_color: None,
-                    background: Some(iced::Background::Color(Color::from_rgb8(13, 22, 38))),
-                    border: Default::default(),
-                    shadow: Default::default(),
-                });
+            header_border_bar =
+                container(text("").size(1))
+                    .width(Length::Fill)
+                    .style(container::Appearance {
+                        text_color: None,
+                        background: Some(iced::Background::Color(Color::from_rgb8(13, 22, 38))),
+                        border: Default::default(),
+                        shadow: Default::default(),
+                    });
+            status_border_bar =
+                container(text("").size(1))
+                    .width(Length::Fill)
+                    .style(container::Appearance {
+                        text_color: None,
+                        background: Some(iced::Background::Color(Color::from_rgb8(13, 22, 38))),
+                        border: Default::default(),
+                        shadow: Default::default(),
+                    });
+            prog_bar_theme = progress_bar::Appearance {
+                background: Background::Color([0.2, 0.2, 0.2].into()),
+                bar: Background::Color(Color::from_rgb8(0, 119, 182)),
+                border_radius: Default::default(),
+            };
         }
 
+        let mut operation_progress_bar = progress_bar::ProgressBar::new(0.0..=100.0, 0.0);
+        if self.is_running {
+            operation_progress_bar = progress_bar::ProgressBar::new(
+                0.0..=100.0,
+                self.get_percent_complete(),
+            )
+            .height(iced::Length::from(20))
+                .style(move |theme: &Theme| {prog_bar_theme});
+        }
 
+        let header_height = Length::from(65);
         if self.show_settings {
             // Settings view
-            let header_height = Length::FillPortion(2);
             let content_height = Length::FillPortion(9);
 
             let settings_header = column![
                 container(
-                row![
-                    // Left side with text
-                    text("Llamapak Settings").size(24).width(Length::FillPortion(2)),
-                    // Spacer that pushes the buttons to the right
-                    container(row![]).width(Length::FillPortion(2)),
-                    // Right side with theme toggle
                     row![
-                        container(iced::widget::toggler("Dark Mode".to_string(), self.settings.dark_mode, |_| {
-                        Message::ToggleDarkMode
-                    })
-                    .size(16)).padding(5).width(Length::FillPortion(2)),
-                        button(text("Sync with Server")).on_press(Message::SyncSettings),
-                        button(text("Save Settings")).on_press(Message::SaveSettings),
+                        // Left side with text
+                        text("Llamapak Settings")
+                            .size(26)
+                            .width(Length::FillPortion(2)),
+                        // Spacer that pushes the buttons to the right
+                        horizontal_space().width(Length::Fill),
+                        // Right side with theme toggle
+                        row![
+                            container(
+                                iced::widget::toggler(
+                                    "Dark Mode".to_string(),
+                                    self.settings.dark_mode,
+                                    |_| { Message::ToggleDarkMode }
+                                )
+                                .size(16)
+                            )
+                            .width(Length::from(140))
+                            .padding(5),
+                            button(
+                                text("Sync with Server").horizontal_alignment(Horizontal::Center)
+                            )
+                            .on_press(Message::SyncSettings),
+                            button(text("Save Settings").horizontal_alignment(Horizontal::Center))
+                                .on_press(Message::SaveSettings),
+                        ]
+                        .spacing(10)
+                        .align_items(Alignment::Center)
                     ]
-                    .spacing(10).width(Length::FillPortion(4))
-                ]
-                .padding(10)
-                .width(Length::Fill)
-                .height(header_height),
-            )
-            .style(iced::widget::container::Appearance {
-                text_color: Some(iced::Color::WHITE),
-                background: Some(iced::Background::Color(header_background_color)),
-                border: Default::default(),
-                shadow: Default::default(),
-            }),header_border_bar];
+                    .padding(10)
+                    .width(Length::Fill)
+                    .height(header_height)
+                    .align_items(Alignment::Center),
+                )
+                .style(iced::widget::container::Appearance {
+                    text_color: Some(iced::Color::WHITE),
+                    background: Some(iced::Background::Color(header_background_color)),
+                    border: Default::default(),
+                    shadow: Default::default(),
+                }),
+                header_border_bar
+            ];
 
             let settings_form = iced::widget::scrollable(
                 column![
@@ -1370,7 +1464,7 @@ impl Application for BackupClient {
                         // Spacer that pushes the buttons to the right
                         container(row![]).width(Length::FillPortion(6)),
                         // Right side with theme toggle
-                        button(text("Add Backup Path"))
+                        button(text("Add Backup Path").horizontal_alignment(Horizontal::Center))
                             .on_press(Message::AddBackupPath)
                             .width(Length::FillPortion(2))
                     ],
@@ -1378,7 +1472,7 @@ impl Application for BackupClient {
                         text_input("Enter file path...", &self.new_backup_path)
                             .on_input(Message::SetNewBackupPath)
                             .width(Length::FillPortion(7)),
-                        button(text("Browse..."))
+                        button(text("Browse...").horizontal_alignment(Horizontal::Center))
                             .on_press(Message::BrowseForBackupFile)
                             .width(Length::FillPortion(1)),
                     ]
@@ -1450,8 +1544,6 @@ impl Application for BackupClient {
                     .spacing(10),
                     // Save and cancel buttons
                     horizontal_rule(1),
-
-
                 ]
                 .spacing(20)
                 .padding(20),
@@ -1461,14 +1553,15 @@ impl Application for BackupClient {
             let status_bar = column![
                 status_border_bar,
                 container(text(&self.status).size(16))
-                .padding(5)
-                .style(container::Appearance {
-                    text_color: Some(iced::Color::WHITE),
-                    background: Some(iced::Background::Color(header_background_color)),
-                    border: Default::default(),
-                    shadow: Default::default(),
-                })
-            .width(Length::Fill)];
+                    .padding(5)
+                    .style(container::Appearance {
+                        text_color: Some(iced::Color::WHITE),
+                        background: Some(iced::Background::Color(header_background_color)),
+                        border: Default::default(),
+                        shadow: Default::default(),
+                    })
+                    .width(Length::Fill)
+            ];
 
             container(column![settings_header, settings_form, status_bar])
                 .width(Length::Fill)
@@ -1478,40 +1571,45 @@ impl Application for BackupClient {
                 .into()
         } else {
             // Main application view
-            let header_height = Length::FillPortion(2);
             let content_height = Length::FillPortion(9);
 
             // Top row (header)
             let header = column![
                 container(
-                row![
-                    // Left side with text
-                    text("Llamapak").size(24),
-                    // Spacer that pushes the buttons to the right
-                    container(row![]).width(Length::Fill),
-                    // Right side with buttons
                     row![
-                        button(text(if self.is_running { "Stop" } else { "Start" })).on_press(
-                            if self.is_running {
+                        // Left side with text
+                        text("Llamapak").size(26),
+                        // Spacer that pushes the buttons to the right
+                        container(row![]).width(Length::Fill),
+                        // Right side with buttons
+                        row![
+                            button(
+                                text(if self.is_running { "Stop" } else { "Start" })
+                                    .horizontal_alignment(Horizontal::Center)
+                            )
+                            .on_press(if self.is_running {
                                 Message::StopBackup
                             } else {
                                 Message::StartBackup
-                            }
-                        ),
-                        button(text("Settings")).on_press(Message::OpenSettings),
+                            }),
+                            button(text("Settings").horizontal_alignment(Horizontal::Center))
+                                .on_press(Message::OpenSettings),
+                        ]
+                        .spacing(10)
                     ]
-                    .spacing(10)
-                ]
-                .padding(10)
-                .width(Length::Fill)
-                .height(header_height),
-            )
-            .style(container::Appearance {
-                text_color: Some(iced::Color::WHITE),
-                background: Some(iced::Background::Color(header_background_color)),
-                border: Default::default(),
-                shadow: Default::default(),
-            }),header_border_bar];
+                    .padding(10)
+                    .width(Length::Fill)
+                    .height(header_height)
+                    .align_items(Alignment::Center),
+                )
+                .style(container::Appearance {
+                    text_color: Some(iced::Color::WHITE),
+                    background: Some(iced::Background::Color(header_background_color)),
+                    border: Default::default(),
+                    shadow: Default::default(),
+                }),
+                header_border_bar
+            ];
 
             // Recent operations from settings
             let operations_list = if !self.settings.recent_operations.is_empty() {
@@ -1567,41 +1665,52 @@ impl Application for BackupClient {
             };
 
             // Main content
-            let content = iced::widget::scrollable(
-                container(column![
-                text(format!(
-                    "Space used ({} %): {} / {}",
-                    (self.space_used * 100 / self.space_available) as u16,format_storage(self.space_used), format_storage(self.space_available)
-                ))
-                .size(16),
-                text(format!("Schedule: {}", self.schedule)).size(16),
-
-                text("Last operations:").size(18),
-                operations_list
-                ].spacing(20).padding(10).width(Length::Fill)
-                )
-            )
-                .height(Length::from(200))
-
+            let content = iced::widget::scrollable(container(
+                column![
+                    text(format!(
+                        "Space used ({} %): {} / {}",
+                        (self.space_used * 100 / self.space_available) as u16,
+                        format_storage(self.space_used),
+                        format_storage(self.space_available)
+                    ))
+                    .size(16),
+                    text(format!("Schedule: {}", self.schedule)).size(16),
+                    text("Last operations:").size(18),
+                    operations_list
+                ]
+                .spacing(20)
+                .padding(10)
+                .width(Length::Fill),
+            ))
+            .height(Length::from(200))
             .height(content_height);
 
             let status_bar = column![
                 status_border_bar,
                 container(text(&self.status).size(16))
-                .padding(5)
-                .style(container::Appearance {
-                    text_color: Some(iced::Color::WHITE),
-                    background: Some(iced::Background::Color(header_background_color)),
-                    border: Default::default(),
-                    shadow: Default::default(),
-                })
-            .width(Length::Fill)];
+                    .padding(5)
+                    .style(container::Appearance {
+                        text_color: Some(iced::Color::WHITE),
+                        background: Some(iced::Background::Color(header_background_color)),
+                        border: Default::default(),
+                        shadow: Default::default(),
+                    })
+                    .width(Length::Fill)
+            ];
 
             // Combine all elements
-            container(column![header, content, status_bar])
-                .height(Length::Fill)
-                .width(Length::Fill)
-                .into()
+            if self.is_running {
+                // asdfasdfasdf
+                container(column![header, content, operation_progress_bar, status_bar])
+                    .height(Length::Fill)
+                    .width(Length::Fill)
+                    .into()
+            } else {
+                container(column![header, content, status_bar])
+                    .height(Length::Fill)
+                    .width(Length::Fill)
+                    .into()
+            }
         }
     }
 
