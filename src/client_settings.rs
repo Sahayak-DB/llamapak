@@ -73,6 +73,7 @@ pub enum OperationStatus {
     Success,
     Failure,
     InProgress,
+    Cancelled,
 }
 
 impl Default for ClientSettings {

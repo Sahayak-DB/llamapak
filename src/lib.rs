@@ -406,3 +406,14 @@ impl ChunkedFileOperation {
         Ok((buffer, chunk_hash))
     }
 }
+pub fn format_storage(number: u64) -> String {
+    let mut result = String::new();
+    let mut number = number;
+    let mut units = vec!["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
+    while number > 1000 {
+        number /= 1000;
+        units.remove(0);
+    }
+    result.push_str(&format!("{:.2} {}", number, units[0]));
+    result
+}

@@ -1,23 +1,19 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result};
 use iced::widget::{
     button, column, container, horizontal_rule, row, text, text_input};
 use iced::window::Position;
 use iced::{Application, Color, Command, Element, Length, Settings, Size, Theme};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::{rustls, TlsConnector};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use llamapak::client_settings::BackupPathEntry;
 use llamapak::tls_client::TlsClient;
-use llamapak::{
-    calculate_hash,
-    client_settings::{ClientSettings, LogLevel, OperationStatus},
-    logger::{initialize_logging, LoggerConfig},
-    receive_message, send_message, BackupMessage, BackupRequest, ChunkedFileOperation,
-    ConnectionConfig, FileInfo, ServerResponse,
-};
+use llamapak::{calculate_hash, client_settings::{ClientSettings, LogLevel, OperationStatus}, format_storage, logger::{initialize_logging, LoggerConfig}, receive_message, send_message, BackupMessage, BackupRequest, ChunkedFileOperation, ConnectionConfig, FileInfo, ServerResponse};
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -76,6 +72,7 @@ struct BackupClient {
     is_directory_backup: bool,
     include_subdirectories: bool,
     file_pattern: String,
+    cancel_token: Arc<AtomicBool>,
 }
 
 impl BackupClient {
@@ -120,8 +117,8 @@ impl BackupClient {
             status: String::new(),
             is_running: false,
             operations: example_operations,
-            space_used: 1024 * 1024 * 100,
-            space_available: 1024 * 1024 * 1000,
+            space_used: 112198210,
+            space_available: 1048576000,
             schedule: "Daily at 11:30".to_string(),
             server_address: server_address.clone(),
             server_port,
@@ -135,6 +132,8 @@ impl BackupClient {
             is_directory_backup: true, // Default to directory backup
             include_subdirectories: true,
             file_pattern: String::new(),
+            cancel_token: Arc::new(
+                std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -339,43 +338,247 @@ impl BackupClient {
     }
 
     pub async fn start_backup(&self, paths: Vec<PathBuf>) -> Result<()> {
+        info!("Starting backup for {} paths", paths.len());
+
+        // Reset the cancellation token before starting a new backup
+        self.cancel_token.store(false, Ordering::SeqCst);
+
+        // Clone the cancellation token for the connect operation
+        let cancel_token = self.cancel_token.clone();
+
         // Connect to the server
-        let mut stream = self.connect().await?;
-
-        for path in paths {
-            // Back up the file
-            self.backup_file_with_existing_connection(&mut stream, path.as_path())
-                .await?;
-        }
-
-        // Send disconnect message using helper function
-        let disconnect_msg = BackupMessage::Disconnect {
-            reason: "Backup session complete".to_string(),
+        let mut stream = match self.connect().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("Failed to connect to server: {}", e);
+                return Err(anyhow::anyhow!("Failed to connect to server: {}", e));
+            }
         };
 
-        if let Err(e) = send_message(&mut stream, &disconnect_msg).await {
-            warn!("Failed to send disconnect message: {}", e);
-            return Err(anyhow::anyhow!("Failed to send disconnect message: {}", e));
+        for path in paths {
+            // Check if the backup has been cancelled
+            if cancel_token.load(Ordering::SeqCst) {
+                info!("Backup operation cancelled");
+                // Optionally notify server about cancellation
+                return Ok(());
+            }
+
+            if path.is_dir() && self.is_directory_backup {
+                // Process directory backup
+                let pattern = if !self.file_pattern.is_empty() {
+                    Some(self.file_pattern.as_str())
+                } else {
+                    None
+                };
+
+                let files = match self.collect_files_from_directory(&path, self.include_subdirectories, pattern) {
+                    Ok(files) => files,
+                    Err(e) => {
+                        error!("Failed to collect files from directory {}: {}", path.display(), e);
+                        return Err(anyhow::anyhow!("Failed to collect files: {}", e));
+                    }
+                };
+
+                // Process each file in the directory
+                for file_path in files {
+                    // Check for cancellation before each file
+                    if cancel_token.load(Ordering::SeqCst) {
+                        info!("Backup operation cancelled during directory processing");
+                        return Ok(());
+                    }
+
+                    // Backup the file
+                    if let Err(e) = self.backup_file_with_cancellation(&mut stream, &file_path, &cancel_token).await {
+                        error!("Failed to backup file {}: {}", file_path.display(), e);
+                        return Err(e);
+                    }
+                }
+            } else if path.is_file() {
+                // Backup a single file
+                if let Err(e) = self.backup_file_with_cancellation(&mut stream, &path, &cancel_token).await {
+                    error!("Failed to backup file {}: {}", path.display(), e);
+                    return Err(e);
+                }
+            } else {
+                warn!("Skipping non-existent path: {}", path.display());
+            }
         }
 
-        // Receive disconnect acknowledgment using helper function
-        match receive_message::<ServerResponse, _>(&mut stream).await {
-            Ok(ServerResponse::DisconnectAck) => {
-                debug!("Server acknowledged disconnect request");
-                Ok(())
+        info!("Backup completed successfully");
+        Ok(())
+
+    }
+    /// Backup a file using an existing connection with cancellation support
+    async fn backup_file_with_cancellation(
+        &self,
+        stream: &mut TlsStream<TcpStream>,
+        file_path: &Path,
+        cancel_token: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        // Check if cancelled before starting file
+        if cancel_token.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        info!(
+        "Starting backup for file using existing connection: {}",
+        file_path.display()
+    );
+
+        // Read the file and get metadata
+        let file_content = tokio::fs::read(file_path).await?;
+        let file_size = file_content.len() as u64;
+
+        // Calculate the file hash
+        let file_hash = calculate_hash(&file_content);
+
+        // Use chunk size from settings if available
+        let requested_chunk_size = self.settings.upload_chunk_size as u64;
+
+        // Create backup request
+        let request = BackupRequest {
+            file_info: FileInfo {
+                path: file_path.to_path_buf(),
+                hash: file_hash.clone(),
+                size: file_size,
+            },
+            chunk_size: requested_chunk_size,
+        };
+
+        // Send init backup message
+        let init_message = BackupMessage::InitBackup(request);
+        send_message(stream, &init_message).await?;
+
+        // Wait for server ready response with negotiated chunk size
+        let response = receive_message::<ServerResponse, _>(stream).await?;
+        let actual_chunk_size = match response {
+            ServerResponse::Ready {
+                negotiated_chunk_size,
+            } => {
+                info!(
+                "Server ready to receive file '{}' with chunk size: {} bytes",
+                file_path.display(),
+                negotiated_chunk_size
+            );
+                negotiated_chunk_size
             }
-            Ok(_) => {
-                let err = anyhow::anyhow!("Unexpected response to disconnect request");
-                warn!("{}", err);
-                Err(err)
+            ServerResponse::Error(msg) => {
+                return Err(anyhow::anyhow!("Server error: {}", msg));
             }
-            Err(e) => {
-                warn!("Error receiving disconnect acknowledgment: {}", e);
-                Err(anyhow::anyhow!(
-                    "Error receiving disconnect acknowledgment: {}",
-                    e
+            _ => {
+                return Err(anyhow::anyhow!("Unexpected server response"));
+            }
+        };
+
+        // Split file into chunks and send each chunk
+        let mut chunks_count = 0;
+        for (i, chunk) in file_content.chunks(actual_chunk_size as usize).enumerate() {
+            // Check for cancellation before sending each chunk
+            if cancel_token.load(Ordering::SeqCst) {
+                // Optionally notify server about cancellation
+                info!("Backup cancelled during file transfer: {}", file_path.display());
+                return Ok(());
+            }
+
+            let offset = i as u64 * actual_chunk_size;
+
+            // Calculate chunk hash
+            let chunk_hash = calculate_hash(chunk);
+
+            // Send chunk
+            let chunk_message = BackupMessage::ChunkData {
+                offset,
+                data: chunk.to_vec(),
+                chunk_hash: chunk_hash.clone(),
+            };
+
+            send_message(stream, &chunk_message).await?;
+
+            // Wait for chunk receipt confirmation
+            let response = receive_message::<ServerResponse, _>(stream).await?;
+            match response {
+                ServerResponse::ChunkReceived {
+                    offset: resp_offset,
+                    verified,
+                } => {
+                    if resp_offset != offset {
+                        return Err(anyhow::anyhow!(
+                        "Server acknowledged wrong chunk offset: {} (expected {})",
+                        resp_offset,
+                        offset
+                    ));
+                    }
+
+                    if !verified {
+                        return Err(anyhow::anyhow!(
+                        "Chunk verification failed at offset {}",
+                        offset
+                    ));
+                    }
+
+                    // Log only occasionally for large files
+                    if chunks_count % 20 == 0 || chunks_count == 0 {
+                        info!(
+                        "Chunk {} at offset {} verified successfully",
+                        chunks_count, offset
+                    );
+                    }
+                }
+                ServerResponse::Error(msg) => {
+                    return Err(anyhow::anyhow!("Server error: {}", msg));
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Unexpected server response"));
+                }
+            }
+
+            chunks_count += 1;
+        }
+
+        // Check for cancellation before sending completion
+        if cancel_token.load(Ordering::SeqCst) {
+            info!("Backup cancelled after sending all chunks: {}", file_path.display());
+            return Ok(());
+        }
+
+        // Send completion message
+        info!(
+        "All chunks sent for file '{}', sending completion message",
+        file_path.display()
+    );
+        let complete_message = BackupMessage::Complete {
+            hash: file_hash,
+            chunks_count,
+        };
+
+        send_message(stream, &complete_message).await?;
+
+        // Wait for completion confirmation
+        let response = receive_message::<ServerResponse, _>(stream).await?;
+        match response {
+            ServerResponse::BackupComplete { verified } => {
+                if verified {
+                    info!(
+                    "File '{}' backup completed and verified successfully",
+                    file_path.display()
+                );
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(
+                    "File '{}' backup completed but verification failed",
+                    file_path.display()
                 ))
+                }
             }
+            ServerResponse::Error(msg) => Err(anyhow::anyhow!(
+            "Server error for file '{}': {}",
+            file_path.display(),
+            msg
+        )),
+            _ => Err(anyhow::anyhow!(
+            "Unexpected server response for file '{}'",
+            file_path.display()
+        )),
         }
     }
 
@@ -647,80 +850,101 @@ impl Application for BackupClient {
                 iced::Command::none()
             }
             Message::StartBackup => {
-                // Check if there are any active backup paths
-                if self.settings.backup_paths.is_empty() {
-                    self.status = "Error: No backup paths specified".to_string();
-                    return iced::Command::none();
-                }
-
-                self.status = "Initializing backup...".to_string();
-                self.is_running = true; // Add this line
-
-                // Log this in settings
-                self.settings.add_log_entry(
-                    "Backup".to_string(),
-                    OperationStatus::InProgress,
-                    format!(
-                        "Starting backup with {} active paths",
-                        self.settings.backup_paths.iter().count()
-                    ),
-                );
-
-                let backup_paths = self.settings.backup_paths.clone();
-                let server_address = self.server_address.clone();
-                let settings = self.settings.clone();
-                let encryption_key = self.encryption_key;
-
-                let mut backup_op_paths: Vec<PathBuf> = Vec::new();
-
-                for path_entry in backup_paths {
-                    let path = PathBuf::from(path_entry.path);
-
-                    if path.is_dir() && path_entry.is_directory {
-                        let files_to_add = self
-                            .collect_files_from_directory(
-                                &path,
-                                path_entry.include_subdirectories,
-                                path_entry.file_pattern.as_deref(),
-                            )
-                            .expect("Unable to extract a file list.");
-
-                        backup_op_paths.extend(files_to_add)
-                    } else {
-                        backup_op_paths.extend(Vec::from([path]));
+                if !self.is_running {
+                    // Check if there are any active backup paths
+                    if self.settings.backup_paths.is_empty() {
+                        self.status = "Error: No backup paths specified".to_string();
+                        return iced::Command::none();
                     }
-                }
+                    
+                    self.is_running = true;
+                    self.status = "Initializing backup...".to_string();
 
-                Command::perform(
-                    async move {
-                        let mut errors = Vec::new();
+                    // Reset cancellation token before starting
+                    self.cancel_token.store(false, Ordering::SeqCst);
 
-                        match start_backup_async(
-                            backup_op_paths.clone(),
-                            server_address.clone(),
-                            settings.clone(),
-                            encryption_key,
-                        )
-                        .await
-                        {
-                            Ok(_) => {}
-                            Err(e) => errors.push(format!("Errors backing up: {}", e)),
-                        }
-                        if errors.is_empty() {
-                            Ok(())
+                    // Clone data needed for the background task
+                    let backup_paths = self.settings.backup_paths.clone();
+                    let server_address = self.server_address.clone();
+                    let server_port = self.server_port;
+                    let settings = self.settings.clone();
+                    let encryption_key = self.encryption_key;
+                    let cancel_token = self.cancel_token.clone();
+
+                    let mut backup_op_paths: Vec<PathBuf> = Vec::new();
+
+                    for path_entry in backup_paths {
+                        let path = PathBuf::from(path_entry.path);
+
+                        if path.is_dir() && path_entry.is_directory {
+                            let files_to_add = self
+                                .collect_files_from_directory(
+                                    &path,
+                                    path_entry.include_subdirectories,
+                                    path_entry.file_pattern.as_deref(),
+                                )
+                                .expect("Unable to extract a file list.");
+
+                            backup_op_paths.extend(files_to_add)
                         } else {
-                            Err(anyhow::anyhow!("Backup errors: {}", errors.join("; ")))
+                            backup_op_paths.extend(Vec::from([path]));
                         }
-                    },
-                    |result| match result {
-                        Ok(()) => Message::BackupInitiated(Ok(())),
-                        Err(e) => Message::BackupInitiated(Err(e.to_string())),
-                    },
-                )
+                    }
+
+                    // Log this in settings
+                    self.settings.add_log_entry(
+                        "Backup".to_string(),
+                        OperationStatus::InProgress,
+                        format!(
+                            "Starting backup with {} active paths",
+                            self.settings.backup_paths.iter().count()
+                        ),
+                    );
+                    
+                    return Command::perform(
+                        async move {
+                            // Here we create a method that checks cancellation during the process
+                            let client_result = setup_backup_client(
+                                server_address,
+                                server_port,
+                                settings.clone(),
+                                encryption_key,
+                                cancel_token.clone()
+                            ).await;
+
+                            match client_result {
+                                Ok(mut client) => {
+                                    // Now use the client to perform the backup
+                                    if cancel_token.load(Ordering::SeqCst) {
+                                        return Ok(false); // Cancelled before starting
+                                    }
+
+                                    match client.start_backup(backup_op_paths).await {
+                                        Ok(_) => Ok(true),  // Success
+                                        Err(e) => Err(e.to_string()), // Error during backup
+                                    }
+                                },
+                                Err(e) => Err(e.to_string()), // Error setting up client
+                            }
+                        },
+                        |result| match result {
+                            Ok(true) => Message::BackupCompleted(Ok(true)),
+                            Ok(false) => Message::BackupCompleted(Ok(false)), // Cancelled
+                            Err(msg) => Message::BackupFailed(msg),
+                        }
+                    )
+                }
+                iced::Command::none()
             }
             Message::StopBackup => {
-                self.is_running = false;
-                self.status = "Backup was stopped".to_string();
+                if self.is_running {
+                    // Set the cancellation flag
+                    self.cancel_token.store(true, Ordering::SeqCst);
+                    self.is_running = false;
+                    self.status = "Backup cancelled".to_string();
+
+                    info!("Backup operation cancellation requested");
+                }
 
                 // Log this in settings
                 self.settings.add_log_entry(
@@ -800,7 +1024,7 @@ impl Application for BackupClient {
             }
             Message::BackupCompleted(result) => {
                 match result {
-                    Ok(_) => {
+                    Ok(true) => {
                         self.is_running = false;
                         self.status = "Backup completed".to_string();
 
@@ -809,6 +1033,16 @@ impl Application for BackupClient {
                             "Backup".to_string(),
                             OperationStatus::Success,
                             format!("Backup of {} completed successfully", self.backup_path),
+                        );
+                    }
+                    Ok(false) => {
+                        self.status = "Backup cancelled".to_string();
+
+                        // Add cancelled operation to log
+                        self.settings.add_log_entry(
+                            "Backup".to_string(),
+                            OperationStatus::Cancelled, // You may need to add this variant to your enum
+                            "Backup operation was cancelled by user".to_string()
                         );
                     }
                     Err(error) => {
@@ -1283,12 +1517,14 @@ impl Application for BackupClient {
                     self.settings
                         .recent_operations
                         .iter()
-                        .take(5)
+                        .rev()
+                        .take(100)
                         .map(|entry| {
                             let status_text = match entry.status {
                                 OperationStatus::Success => "Success",
                                 OperationStatus::Failure => "Failed",
                                 OperationStatus::InProgress => "In Progress",
+                                OperationStatus::Cancelled => "Canceled",
                             };
 
                             // Use unwrap_or_else for better error handling
@@ -1332,21 +1568,21 @@ impl Application for BackupClient {
             let content = iced::widget::scrollable(
                 container(column![
                 text(format!(
-                    "Space used/available: {} / {} bytes",
-                    self.space_used, self.space_available
+                    "Space used ({} %): {} / {}",
+                    (self.space_used * 100 / self.space_available) as u16,format_storage(self.space_used), format_storage(self.space_available)
                 ))
                 .size(16),
                 text(format!("Schedule: {}", self.schedule)).size(16),
-                
+
                 text("Last operations:").size(18),
                 operations_list
                 ].spacing(20).padding(10).width(Length::Fill)
                 )
             )
                 .height(Length::from(200))
-                
+
             .height(content_height);
-            
+
             let status_bar = column![
                 status_border_bar,
                 container(text(&self.status).size(16))
@@ -1358,7 +1594,7 @@ impl Application for BackupClient {
                     shadow: Default::default(),
                 })
             .width(Length::Fill)];
-            
+
             // Combine all elements
             container(column![header, content, status_bar])
                 .height(Length::Fill)
@@ -1411,6 +1647,30 @@ struct OperationLog {
     size_transferred: u64,
 }
 
+// Helper function to set up a backup client with cancellation support
+async fn setup_backup_client(
+    server_address: String,
+    server_port: u16,
+    settings: ClientSettings,
+    encryption_key: [u8; 32],
+    cancel_token: Arc<AtomicBool>,
+) -> Result<BackupClient> {
+    // Check cancellation
+    if cancel_token.load(Ordering::SeqCst) {
+        return Err(anyhow::anyhow!("Setup cancelled"));
+    }
+
+    // Create a new client
+    let mut client = BackupClient::new(server_address, server_port);
+    client.settings = settings;
+    client.encryption_key = encryption_key;
+    client.cancel_token = cancel_token;
+
+    // Initialize client
+    client.initialize().await?;
+
+    Ok(client)
+}
 async fn start_backup_async(
     file_paths: Vec<PathBuf>,
     server_addr: String,
