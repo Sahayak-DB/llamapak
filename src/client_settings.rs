@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chacha20poly1305::{aead::Aead, AeadCore, ChaCha20Poly1305, KeyInit};
-use rand::{rngs::OsRng, Rng, RngCore};
+use rand::{rngs::OsRng, Rng};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Write};

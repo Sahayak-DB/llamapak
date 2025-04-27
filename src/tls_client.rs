@@ -13,7 +13,6 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::{rustls, TlsConnector};
-use tracing::instrument::WithSubscriber;
 use tracing::{debug, info, warn};
 
 /// A client for secure file operations over TLS

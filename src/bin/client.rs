@@ -1,11 +1,8 @@
 use anyhow::{Context, Result};
 use iced::widget::{
-    button, column, container, horizontal_rule, row, text, text_input, Container, Space,
-};
+    button, column, container, horizontal_rule, row, text, text_input};
 use iced::window::Position;
 use iced::{Application, Color, Command, Element, Length, Settings, Size, Theme};
-use iced_style;
-use rustls::pki_types::ServerName;
 use std::path::{Path, PathBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -150,9 +147,11 @@ impl BackupClient {
             .map(|(index, entry)| {
                 row![
                     // Path type icon (folder or file)
+
                     text(if entry.is_directory { "D:" } else { "F:" }).size(16),
                     // Path details
                     column![
+                        horizontal_rule(1),
                         text(&entry.path).size(16),
                         if entry.is_directory {
                             text(format!(
@@ -189,9 +188,10 @@ impl BackupClient {
                     button(text("Delete"))
                         .on_press(Message::RemoveBackupPath(index))
                         .style(iced::theme::Button::Destructive),
+                    text("").size(16),
                 ]
                 .spacing(10)
-                .padding(5)
+
                 .width(Length::Fill)
                 .into()
             })
@@ -1045,49 +1045,87 @@ impl Application for BackupClient {
 
     fn view(&self) -> Element<Message> {
         let header_background_color;
+        let header_border_bar;
+        let status_border_bar;
 
         if self.settings.dark_mode {
             // Dark mode
             header_background_color = iced::Color::from_rgb8(13, 22, 38);
+            header_border_bar = container(text("")
+                .size(1)).width(Length::Fill)
+                .style(container::Appearance {
+                    text_color: None,
+                    background: Some(iced::Background::Color(Color::from_rgb8(0, 119, 182))),
+                    border: Default::default(),
+                    shadow: Default::default(),
+                });
+            status_border_bar = container(text("")
+                .size(1)).width(Length::Fill)
+                .style(container::Appearance {
+                    text_color: None,
+                    background: Some(iced::Background::Color(Color::from_rgb8(0, 119, 182))),
+                    border: Default::default(),
+                    shadow: Default::default(),
+                });
         } else {
             // Light mode
             header_background_color = iced::Color::from_rgb8(0, 119, 182);
+            header_border_bar = container(text("")
+                .size(1)).width(Length::Fill)
+                .style(container::Appearance {
+                    text_color: None,
+                    background: Some(iced::Background::Color(Color::from_rgb8(13, 22, 38))),
+                    border: Default::default(),
+                    shadow: Default::default(),
+                });
+            status_border_bar = container(text("")
+                .size(1)).width(Length::Fill)
+                .style(container::Appearance {
+                    text_color: None,
+                    background: Some(iced::Background::Color(Color::from_rgb8(13, 22, 38))),
+                    border: Default::default(),
+                    shadow: Default::default(),
+                });
         }
+
 
         if self.show_settings {
             // Settings view
             let header_height = Length::FillPortion(2);
             let content_height = Length::FillPortion(9);
 
-            let settings_header = container(
+            let settings_header = column![
+                container(
                 row![
                     // Left side with text
-                    text("Client Settings").size(24),
+                    text("Llamapak Settings").size(24).width(Length::FillPortion(2)),
                     // Spacer that pushes the buttons to the right
-                    container(row![]).width(Length::Fill),
+                    container(row![]).width(Length::FillPortion(2)),
                     // Right side with theme toggle
-                    iced::widget::toggler("Dark Mode".to_string(), self.settings.dark_mode, |_| {
+                    row![
+                        container(iced::widget::toggler("Dark Mode".to_string(), self.settings.dark_mode, |_| {
                         Message::ToggleDarkMode
                     })
-                    .size(16)
-                    .width(Length::Fill)
+                    .size(16)).padding(5).width(Length::FillPortion(2)),
+                        button(text("Sync with Server")).on_press(Message::SyncSettings),
+                        button(text("Save Settings")).on_press(Message::SaveSettings),
+                    ]
+                    .spacing(10).width(Length::FillPortion(4))
                 ]
                 .padding(10)
                 .width(Length::Fill)
                 .height(header_height),
             )
             .style(iced::widget::container::Appearance {
-                text_color: None,
+                text_color: Some(iced::Color::WHITE),
                 background: Some(iced::Background::Color(header_background_color)),
                 border: Default::default(),
                 shadow: Default::default(),
-            });
+            }),header_border_bar];
 
             let settings_form = iced::widget::scrollable(
                 column![
                     // Backup Paths section
-                    horizontal_rule(1),
-                    text("Backup Targets:").size(18),
                     self.view_backup_paths(),
                     // Add new backup path form
                     row![
@@ -1098,7 +1136,6 @@ impl Application for BackupClient {
                         // Right side with theme toggle
                         button(text("Add Backup Path"))
                             .on_press(Message::AddBackupPath)
-                            .width(Length::FillPortion(2))
                             .width(Length::FillPortion(2))
                     ],
                     row![
@@ -1177,20 +1214,27 @@ impl Application for BackupClient {
                     .spacing(10),
                     // Save and cancel buttons
                     horizontal_rule(1),
-                    row![
-                        button(text("Save Settings")).on_press(Message::SaveSettings),
-                        button(text("Sync with Server")).on_press(Message::SyncSettings),
-                    ]
-                    .spacing(10),
-                    // Status message
-                    text(&self.status).size(16),
+
+
                 ]
                 .spacing(20)
                 .padding(20),
             )
             .height(content_height);
 
-            container(column![settings_header, settings_form])
+            let status_bar = column![
+                status_border_bar,
+                container(text(&self.status).size(16))
+                .padding(5)
+                .style(container::Appearance {
+                    text_color: Some(iced::Color::WHITE),
+                    background: Some(iced::Background::Color(header_background_color)),
+                    border: Default::default(),
+                    shadow: Default::default(),
+                })
+            .width(Length::Fill)];
+
+            container(column![settings_header, settings_form, status_bar])
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .center_x()
@@ -1202,7 +1246,8 @@ impl Application for BackupClient {
             let content_height = Length::FillPortion(9);
 
             // Top row (header)
-            let header = container(
+            let header = column![
+                container(
                 row![
                     // Left side with text
                     text("Llamapak").size(24),
@@ -1225,12 +1270,12 @@ impl Application for BackupClient {
                 .width(Length::Fill)
                 .height(header_height),
             )
-            .style(iced::widget::container::Appearance {
-                text_color: None,
+            .style(container::Appearance {
+                text_color: Some(iced::Color::WHITE),
                 background: Some(iced::Background::Color(header_background_color)),
                 border: Default::default(),
                 shadow: Default::default(),
-            });
+            }),header_border_bar];
 
             // Recent operations from settings
             let operations_list = if !self.settings.recent_operations.is_empty() {
@@ -1284,35 +1329,38 @@ impl Application for BackupClient {
             };
 
             // Main content
-            let content = column![
-                // Second row
-                text("Last operations:").size(18),
-                // Third row
-                operations_list,
-                // Fourth row
+            let content = iced::widget::scrollable(
+                container(column![
                 text(format!(
                     "Space used/available: {} / {} bytes",
                     self.space_used, self.space_available
                 ))
                 .size(16),
-                // Fifth row
                 text(format!("Schedule: {}", self.schedule)).size(16),
-                // Sixth row - Status
-                text(&self.status).size(16),
-                // Server info from settings
-                text(format!(
-                    "Connected to: {}:{}",
-                    self.settings.server_ip, self.settings.server_port
-                ))
-                .size(16),
-            ]
-            .spacing(20)
-            .padding(10)
-            .width(Length::Fill)
+                
+                text("Last operations:").size(18),
+                operations_list
+                ].spacing(20).padding(10).width(Length::Fill)
+                )
+            )
+                .height(Length::from(200))
+                
             .height(content_height);
-
+            
+            let status_bar = column![
+                status_border_bar,
+                container(text(&self.status).size(16))
+                .padding(5)
+                .style(container::Appearance {
+                    text_color: Some(iced::Color::WHITE),
+                    background: Some(iced::Background::Color(header_background_color)),
+                    border: Default::default(),
+                    shadow: Default::default(),
+                })
+            .width(Length::Fill)];
+            
             // Combine all elements
-            container(column![header, content])
+            container(column![header, content, status_bar])
                 .height(Length::Fill)
                 .width(Length::Fill)
                 .into()
@@ -1424,6 +1472,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut settings = Settings::default();
+    settings.window.min_size = Some(Size::new(900.0, 560.0));
     settings.window.size = Size::new(900.0, 560.0);
     settings.window.position = Position::Centered;
 
