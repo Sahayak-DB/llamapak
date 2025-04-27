@@ -1,11 +1,11 @@
-use iced_style;
-use rustls::pki_types::ServerName;
 use anyhow::{Context, Result};
 use iced::widget::{
     button, column, container, horizontal_rule, row, text, text_input, Container, Space,
 };
 use iced::window::Position;
 use iced::{Application, Color, Command, Element, Length, Settings, Size, Theme};
+use iced_style;
+use rustls::pki_types::ServerName;
 use std::path::{Path, PathBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -1090,7 +1090,17 @@ impl Application for BackupClient {
                     text("Backup Targets:").size(18),
                     self.view_backup_paths(),
                     // Add new backup path form
-                    text("Add New Backup Path").size(16),
+                    row![
+                        // Left side with text
+                        text("Add New Backup Path").size(16),
+                        // Spacer that pushes the buttons to the right
+                        container(row![]).width(Length::FillPortion(6)),
+                        // Right side with theme toggle
+                        button(text("Add Backup Path"))
+                            .on_press(Message::AddBackupPath)
+                            .width(Length::FillPortion(2))
+                            .width(Length::FillPortion(2))
+                    ],
                     row![
                         text_input("Enter file path...", &self.new_backup_path)
                             .on_input(Message::SetNewBackupPath)
@@ -1101,47 +1111,50 @@ impl Application for BackupClient {
                     ]
                     .spacing(10),
                     // Backup type controls
-                    row![
-                        text("Type:").size(16),
-                        button(text(if self.is_directory_backup {
-                            "Directory"
-                        } else {
-                            "File"
-                        }))
-                        .on_press(Message::SelectBackupPathType(!self.is_directory_backup))
-                        .width(Length::from(100)),
-                    ]
-                    .spacing(10),
+
                     // Subdirectory controls (only visible for directory backups)
                     if self.is_directory_backup {
-                        row![iced::widget::toggler(
-                            "Include Subdirectories".to_string(),
-                            self.include_subdirectories,
-                            |_| Message::SetBackupPathIncludeSubdirs(!self.include_subdirectories)
-                        )
-                        .size(16)
-                        .width(Length::Fill),]
-                        .spacing(10)
-                    } else {
-                        row![Container::new(Space::new(Length::Fill, Length::Fill))]
-                    },
-                    // File pattern control (only visible for directory backups)
-                    if self.is_directory_backup {
                         row![
-                            text("File Pattern:").size(16),
-                            text_input("e.g., *.txt,*.md", &self.file_pattern)
-                                .on_input(Message::SetBackupPathPattern)
-                                .width(Length::Fill),
-                            button(text("Add Backup Path"))
-                                .on_press(Message::AddBackupPath)
-                                .width(Length::Fill),
+                            iced::widget::toggler(
+                                if self.is_directory_backup {
+                                    String::from("Directory")
+                                } else {
+                                    String::from("File")
+                                },
+                                self.is_directory_backup,
+                                |_| Message::SelectBackupPathType(!self.is_directory_backup)
+                            )
+                            .size(16)
+                            .width(Length::FillPortion(2)),
+                            column![
+                                iced::widget::toggler(
+                                    "Include Subdirectories".to_string(),
+                                    self.include_subdirectories,
+                                    |_| Message::SetBackupPathIncludeSubdirs(
+                                        !self.include_subdirectories
+                                    )
+                                )
+                                .size(16),
+                                row![
+                                text("File Pattern:").size(16),
+                                text_input("e.g., *.txt,*.md", &self.file_pattern)
+                                    .on_input(Message::SetBackupPathPattern)
+                                    .width(Length::FillPortion(6)),].spacing(10)
+                            ].spacing(10).width(Length::FillPortion(7))
                         ]
                         .spacing(10)
                     } else {
-                        row![button(text("Add Backup Path"))
-                            .on_press(Message::AddBackupPath)
-                            .width(Length::Fill),]
-                        .spacing(0) // Empty row instead of container
+                        row![iced::widget::toggler(
+                            if self.is_directory_backup {
+                                String::from("Directory")
+                            } else {
+                                String::from("File")
+                            },
+                            self.is_directory_backup,
+                            |_| Message::SelectBackupPathType(!self.is_directory_backup)
+                        )
+                        .size(16)]
+                        .spacing(10)
                     },
                     // Server settings
                     horizontal_rule(1),
