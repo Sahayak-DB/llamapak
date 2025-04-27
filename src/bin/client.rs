@@ -1,3 +1,5 @@
+use iced_style;
+use rustls::pki_types::ServerName;
 use anyhow::{Context, Result};
 use iced::widget::{
     button, column, container, horizontal_rule, row, text, text_input, Container, Space,
@@ -320,13 +322,15 @@ impl BackupClient {
         let connector = self
             .connector
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("TLS connector not initialized"))?;
+            .ok_or_else(|| anyhow::anyhow!("TLS connector not initialized"))?
+            .clone();
 
         let server_addr = format!("{}:{}", self.server_address, self.server_port);
         info!("Connecting to server at {}", server_addr);
 
         let stream = TcpStream::connect(&server_addr).await?;
-        let domain = rustls::ServerName::try_from(self.server_address.as_str())?;
+        let domain_string = self.server_address.clone();
+        let domain = rustls::pki_types::ServerName::try_from(domain_string)?;
 
         let tls_stream = connector.connect(domain, stream).await?;
         info!("TLS connection established");
