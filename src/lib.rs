@@ -17,6 +17,7 @@ pub const OPTIMAL_CHUNK_SIZE: u64 = 1 * 1024 * 1024; // 1MB default
 pub const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
 pub const DEFAULT_PORT: u16 = 3000;
 
+#[derive(Debug, Clone)]
 pub struct ConnectionConfig {
     pub server_address: String,
     pub server_port: u16,

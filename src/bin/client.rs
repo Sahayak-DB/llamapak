@@ -1234,7 +1234,7 @@ impl Application for BackupClient {
             Message::SettingsSaved(result) => {
                 match result {
                     Ok(_) => {
-                        self.status = "Settings saved successfully".to_string();
+                        self.status = "Synchronized with server".to_string();
                     }
                     Err(e) => {
                         self.status = format!("Failed to save settings: {}", e);

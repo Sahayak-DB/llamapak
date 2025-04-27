@@ -16,6 +16,7 @@ use tokio_rustls::{rustls, TlsConnector};
 use tracing::{debug, info, warn};
 
 /// A client for secure file operations over TLS
+#[derive(Clone)]
 pub struct TlsClient {
     connector: TlsConnector,
     connection_config: ConnectionConfig,
